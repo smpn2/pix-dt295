@@ -7,10 +7,12 @@
 //! back and opens it again. A B-CAS card pulled or put in during a stream leaves it
 //! running scrambled: the stream is started over on a booted device ([`CardWatch`]), as
 //! is a stream whose firmware stopped acking.
+//!
+//! A unit streams on one path, System1 or raw-TS: the configured one, or (a unit opened
+//! for a request) the one its first request asked for. A request for the other path is
+//! refused while the unit is open.
 
 use std::io::Write;
-use std::os::fd::AsRawFd;
-use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TryRecvError, TrySendError};
@@ -18,19 +20,51 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use dt295::ipc::{Conn, peer_closed};
 use dt295::state::{State, key_journal};
-use dt295::{CardWatch, Device, RAW_STALL, System, TsSink, raw_stall_due};
+use dt295::{CardWatch, Device, Live, RAW_STALL, System, TsSink, raw_stall_due};
 use tracing::{info, warn};
 
 use super::conf::Conf;
-use super::proto::{Reply, Request, Tuning};
+use super::proto::{Mode, Reply, Request, Tuning};
 use crate::rawts;
 use crate::tuner::stopping;
 
 /// A request and the connection its TS goes to.
 pub struct Job {
     pub req: Request,
-    pub conn: UnixStream,
+    pub conn: Conn,
+}
+
+/// What a unit's thread tells the daemon: whether it is busy (`--idle-exit` waits for
+/// it), and the C/N of its stream (`status`).
+#[derive(Debug, Default)]
+pub struct Info {
+    /// A request is being served: tuning, or streaming.
+    busy: AtomicBool,
+    /// The running stream's device values and the C/N of its tune.
+    stream: Mutex<Option<(Live, Option<i32>)>>,
+}
+
+impl Info {
+    pub fn busy(&self) -> bool {
+        self.busy.load(Ordering::Acquire)
+    }
+
+    /// The running stream's C/N (0.001 dB): its latest, else its tune's.
+    pub fn cn_mdb(&self) -> Option<i32> {
+        let stream = self.stream.lock().unwrap_or_else(PoisonError::into_inner);
+        let (live, tuned) = stream.as_ref()?;
+        live.cn_mdb().or(*tuned)
+    }
+
+    fn set_busy(&self, busy: bool) {
+        self.busy.store(busy, Ordering::Release);
+    }
+
+    fn set_stream(&self, stream: Option<(Live, Option<i32>)>) {
+        *self.stream.lock().unwrap_or_else(PoisonError::into_inner) = stream;
+    }
 }
 
 /// Idle cadence: the keepalive check (it only sends when one is due).
@@ -49,23 +83,29 @@ const QUEUE_READS: usize = 256;
 /// before the next tune (the remux can stop emitting TS after many bring-ups).
 const SILENT: Duration = Duration::from_secs(10);
 
+/// Start the thread of unit `serial`, streaming on `mode`; `fixed`: the configuration's
+/// (the mode never changes).
 pub fn spawn(
     serial: String,
-    raw: bool,
+    mode: Mode,
+    fixed: bool,
     conf: Arc<Conf>,
+    info: Arc<Info>,
 ) -> std::io::Result<(mpsc::Sender<Job>, JoinHandle<()>)> {
     let (tx, rx) = mpsc::channel();
     let thread = thread::Builder::new()
         .name(format!("unit {serial}"))
-        .spawn(move || run(&serial, raw, &conf, &rx))?;
+        .spawn(move || run(&serial, mode, fixed, &conf, &info, &rx))?;
     Ok((tx, thread))
 }
 
-fn run(serial: &str, raw: bool, conf: &Conf, jobs: &Receiver<Job>) {
+fn run(serial: &str, mode: Mode, fixed: bool, conf: &Conf, info: &Info, jobs: &Receiver<Job>) {
     let span = tracing::info_span!("unit", serial);
     let _entered = span.enter();
-    let mut unit = Unit::new(serial, raw, conf);
+    let mut unit = Unit::new(serial, mode == Mode::RawTs, fixed, conf, info);
     let mut next = None;
+    // the client of the last request served
+    let mut last: Option<String> = None;
     while !stopping() {
         unit.open_if_due();
         let job = match next.take() {
@@ -79,27 +119,37 @@ fn run(serial: &str, raw: bool, conf: &Conf, jobs: &Receiver<Job>) {
                 Err(RecvTimeoutError::Disconnected) => break,
             },
         };
-        let job = yield_to_queued(job, jobs, serial);
+        let job = yield_to_queued(job, jobs, serial, last.as_deref());
+        last.clone_from(&job.req.client);
+        let busy = Busy::new(info);
         next = unit.serve(job, jobs);
+        drop(busy);
     }
     unit.close();
+}
+
+/// Whether `asked` comes from the client whose stream `running` is (it replaces its own
+/// stream, also `if-free`).
+fn same_client(asked: &Request, running: &Request) -> bool {
+    asked.client.is_some() && asked.client == running.client
 }
 
 /// Of a background request (`if-free`: a logo run, a channel scan) and one queued
 /// right behind it, the one that takes units over goes first and the background one
 /// is refused: started, it would only be taken over seconds later. Two background
-/// requests: the first goes, the second is refused.
-fn yield_to_queued(job: Job, jobs: &Receiver<Job>, serial: &str) -> Job {
+/// requests: that of the client the unit served last goes (a TVTest changing its
+/// channel goes before another one's retry), else the first; the other is refused.
+fn yield_to_queued(job: Job, jobs: &Receiver<Job>, serial: &str, last: Option<&str>) -> Job {
     if !job.req.if_free {
         return job;
     }
     let Ok(other) = jobs.try_recv() else {
         return job;
     };
-    let (go, mut refused) = if other.req.if_free {
-        (job, other)
-    } else {
+    let (go, mut refused) = if other_goes(&job.req, &other.req, last) {
         (other, job)
+    } else {
+        (job, other)
     };
     info!(
         "{}: refused, another request came with it",
@@ -110,12 +160,23 @@ fn yield_to_queued(job: Job, jobs: &Receiver<Job>, serial: &str) -> Job {
     go
 }
 
+/// Of a background request `first` and `other` queued behind it, whether `other` goes
+/// ([`yield_to_queued`]).
+fn other_goes(first: &Request, other: &Request, last: Option<&str>) -> bool {
+    let of_last = |r: &Request| last.is_some() && r.client.as_deref() == last;
+    !other.if_free || (of_last(other) && !of_last(first))
+}
+
 struct Unit<'a> {
     serial: &'a str,
     conf: &'a Conf,
+    info: &'a Info,
     /// Blob-free raw-TS mode: no vendor firmware, the device streams the scrambled TS
-    /// (the host descrambles). Chosen per unit in the configuration.
+    /// (the host descrambles). Chosen per unit in the configuration, or by the first
+    /// request.
     raw: bool,
+    /// The configuration chose the mode: no request changes it.
+    fixed: bool,
     dev: Option<Device>,
     state_path: PathBuf,
     /// What the state file holds (the journal also writes keys to it directly).
@@ -136,11 +197,13 @@ struct Unit<'a> {
 }
 
 impl<'a> Unit<'a> {
-    fn new(serial: &'a str, raw: bool, conf: &'a Conf) -> Self {
+    fn new(serial: &'a str, raw: bool, fixed: bool, conf: &'a Conf, info: &'a Info) -> Self {
         Self {
             serial,
             conf,
+            info,
             raw,
+            fixed,
             dev: None,
             state_path: conf.state_file(serial),
             state: State::default(),
@@ -307,8 +370,43 @@ impl<'a> Unit<'a> {
         }
     }
 
+    fn mode(&self) -> Mode {
+        if self.raw { Mode::RawTs } else { Mode::System1 }
+    }
+
+    /// Stream on `mode` (`None`: the unit's own): a unit not open that the configuration
+    /// does not fix takes it; `Err` says why not.
+    fn take_mode(&mut self, mode: Option<Mode>) -> Result<(), String> {
+        let Some(mode) = mode.filter(|&m| m != self.mode()) else {
+            return Ok(());
+        };
+        let (have, want) = (self.mode().word(), mode.word());
+        if self.fixed {
+            return Err(format!(
+                "unit {} streams {have} (as configured), not {want}",
+                self.serial
+            ));
+        }
+        if self.dev.is_some() {
+            return Err(format!(
+                "unit {} streams {have} (the path it was opened on), not {want}",
+                self.serial
+            ));
+        }
+        info!("{want} from now on");
+        self.raw = mode == Mode::RawTs;
+        self.watch = None;
+        self.reboot = false;
+        Ok(())
+    }
+
     /// Serve one request; returns a request that took the unit over meanwhile.
-    fn serve(&mut self, job: Job, jobs: &Receiver<Job>) -> Option<Job> {
+    fn serve(&mut self, mut job: Job, jobs: &Receiver<Job>) -> Option<Job> {
+        if let Err(why) = self.take_mode(job.req.mode) {
+            warn!("{}: {why}", job.req.to_line());
+            let _ = reply(&mut job.conn, &Reply::Error(why));
+            return None;
+        }
         if self.raw {
             return self.serve_raw(job, jobs);
         }
@@ -358,22 +456,30 @@ impl<'a> Unit<'a> {
                     .and_then(|()| start(&mut dev, &req, pipe.sink()));
             }
         }
-        if let Err(why) = started {
-            warn!("{}: {why}", req.to_line());
-            let _ = reply(&mut conn, &Reply::Error(why));
-            self.dev = Some(dev);
-            return None;
-        }
+        let cn_mdb = match started {
+            Ok(cn_mdb) => cn_mdb,
+            Err(why) => {
+                warn!("{}: {why}", req.to_line());
+                let _ = reply(&mut conn, &Reply::Error(why));
+                self.dev = Some(dev);
+                return None;
+            }
+        };
         info!(
             "{}: streaming ({} ms)",
             req.to_line(),
             t0.elapsed().as_millis()
         );
-        if reply(&mut conn, &Reply::Ok).is_err() {
+        self.info.set_stream(Some((dev.live(), cn_mdb)));
+        // to end a write the client never takes (a takeover must not wait for it)
+        let streaming = Streaming::new(self.info, &pipe, &conn);
+        let ok = Reply::Ok {
+            unit: Some(self.serial.to_owned()),
+            cn_mdb,
+        };
+        if reply(&mut conn, &ok).is_err() {
             pipe.closed.store(true, Ordering::Release); // the client is gone already
         }
-        // to end a write the client never takes (a takeover must not wait for it)
-        let shutter = conn.try_clone().ok();
         let writer = {
             let pipe = Arc::clone(&pipe);
             thread::Builder::new()
@@ -393,12 +499,13 @@ impl<'a> Unit<'a> {
             }
             // a write fails at once, but while nothing is written (the stream holds its
             // TS back until the service's PAT) only the socket tells
-            if pipe.closed.load(Ordering::Acquire) || shutter.as_ref().is_some_and(peer_closed) {
+            if pipe.closed.load(Ordering::Acquire) || streaming.client_closed() {
                 break "the client went away";
             }
             match jobs.try_recv() {
-                // a background job (logo collection) never takes a stream over
-                Ok(mut job) if job.req.if_free => {
+                // a background job (logo collection), or a client that does not cut
+                // another's stream off, never takes a stream over
+                Ok(mut job) if job.req.if_free && !same_client(&job.req, &req) => {
                     info!("{}: refused, the unit is streaming", job.req.to_line());
                     let why = format!("unit {} is streaming", self.serial);
                     let _ = reply(&mut job.conn, &Reply::Busy(why));
@@ -436,7 +543,7 @@ impl<'a> Unit<'a> {
                 } else {
                     boot(&mut dev, &fw)
                         .map_err(|e| format!("cannot boot the unit: {e}"))
-                        .and_then(|()| start(&mut dev, &req, pipe.sink()))
+                        .and_then(|()| start(&mut dev, &req, pipe.sink()).map(drop))
                 };
                 if let Some(w) = self.watch.as_mut() {
                     w.started_over(Instant::now());
@@ -453,10 +560,7 @@ impl<'a> Unit<'a> {
         if let Err(e) = dev.stream_stop() {
             warn!("stream stop failed: {e}");
         }
-        pipe.finish();
-        if let Some(conn) = &shutter {
-            let _ = conn.shutdown(std::net::Shutdown::Both);
-        }
+        drop(streaming);
         if let Ok(writer) = writer {
             let _ = writer.join();
         }
@@ -533,10 +637,17 @@ impl<'a> Unit<'a> {
             req.to_line(),
             t0.elapsed().as_millis()
         );
-        if reply(&mut conn, &Reply::Ok).is_err() {
+        // the worker publishes the C/N of the lock as the stream starts
+        let cn_mdb = dev.live().cn_mdb();
+        self.info.set_stream(Some((dev.live(), cn_mdb)));
+        let streaming = Streaming::new(self.info, &pipe, &conn);
+        let ok = Reply::Ok {
+            unit: Some(self.serial.to_owned()),
+            cn_mdb,
+        };
+        if reply(&mut conn, &ok).is_err() {
             pipe.closed.store(true, Ordering::Release); // the client is gone already
         }
-        let shutter = conn.try_clone().ok();
         let writer = {
             let pipe = Arc::clone(&pipe);
             thread::Builder::new()
@@ -558,11 +669,11 @@ impl<'a> Unit<'a> {
             if stopping() {
                 break "the daemon stops";
             }
-            if pipe.closed.load(Ordering::Acquire) || shutter.as_ref().is_some_and(peer_closed) {
+            if pipe.closed.load(Ordering::Acquire) || streaming.client_closed() {
                 break "the client went away";
             }
             match jobs.try_recv() {
-                Ok(mut job) if job.req.if_free => {
+                Ok(mut job) if job.req.if_free && !same_client(&job.req, &req) => {
                     info!("{}: refused, the unit is streaming", job.req.to_line());
                     let why = format!("unit {} is streaming", self.serial);
                     let _ = reply(&mut job.conn, &Reply::Busy(why));
@@ -633,10 +744,7 @@ impl<'a> Unit<'a> {
         if let Err(e) = dev.stream_stop_raw() {
             warn!("raw stream stop failed: {e}");
         }
-        pipe.finish();
-        if let Some(conn) = &shutter {
-            let _ = conn.shutdown(std::net::Shutdown::Both);
-        }
+        drop(streaming);
         if let Ok(writer) = writer {
             let _ = writer.join();
         }
@@ -680,8 +788,9 @@ fn boot(dev: &mut Device, fw: &std::path::Path) -> dt295::Result<()> {
     Ok(())
 }
 
-/// Tune, wait for lock (up to ~3 s more), and start streaming into `sink`.
-fn start(dev: &mut Device, req: &Request, sink: TsSink) -> Result<(), String> {
+/// Tune, wait for lock (up to ~3 s more), and start streaming into `sink`. Returns the
+/// C/N of the lock (0.001 dB).
+fn start(dev: &mut Device, req: &Request, sink: TsSink) -> Result<Option<i32>, String> {
     let sys = match req.tuning {
         Tuning::Terrestrial { hz } => {
             dev.tune_t(hz).map_err(|e| format!("tune: {e}"))?;
@@ -695,7 +804,7 @@ fn start(dev: &mut Device, req: &Request, sink: TsSink) -> Result<(), String> {
     let mut lock = Err(String::new());
     for _ in 0..30 {
         lock = match dev.read_status(sys) {
-            Ok(st) if st.locked => Ok(()),
+            Ok(st) if st.locked => Ok(st.cn_mdb),
             Ok(st) => Err(format!(
                 "no lock (C/N {:.1} dB)",
                 f64::from(st.cn_mdb) / 1000.0
@@ -707,13 +816,14 @@ fn start(dev: &mut Device, req: &Request, sink: TsSink) -> Result<(), String> {
         }
         thread::sleep(Duration::from_millis(100));
     }
-    lock?;
+    let cn_mdb = lock?;
     dev.set_service_id(req.sid);
     dev.stream_start(sink)
-        .map_err(|e| format!("stream start: {e}"))
+        .map_err(|e| format!("stream start: {e}"))?;
+    Ok(Some(cn_mdb))
 }
 
-fn reply(conn: &mut UnixStream, r: &Reply) -> std::io::Result<()> {
+fn reply(conn: &mut Conn, r: &Reply) -> std::io::Result<()> {
     conn.write_all(format!("{}\n", r.to_line()).as_bytes())
 }
 
@@ -772,35 +882,132 @@ impl Pipe {
     }
 }
 
-/// Whether the client closed its end (without reading or writing anything).
-fn peer_closed(conn: &UnixStream) -> bool {
-    let mut b = 0u8;
-    // SAFETY: a valid socket and a 1-byte buffer; MSG_DONTWAIT makes only this call
-    // non-blocking (the writer thread shares the socket in blocking mode).
-    let n = unsafe {
-        libc::recv(
-            conn.as_raw_fd(),
-            (&raw mut b).cast(),
-            1,
-            libc::MSG_PEEK | libc::MSG_DONTWAIT,
-        )
-    };
-    match n {
-        0 => true, // end of stream
-        n if n > 0 => false,
-        _ => !matches!(
-            std::io::Error::last_os_error().kind(),
-            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
-        ),
+/// A request served: the unit thread is busy (`--idle-exit` waits) until this is dropped,
+/// also by a panic.
+struct Busy<'a>(&'a Info);
+
+impl<'a> Busy<'a> {
+    fn new(info: &'a Info) -> Self {
+        info.set_busy(true);
+        Self(info)
+    }
+}
+
+impl Drop for Busy<'_> {
+    fn drop(&mut self) {
+        self.0.set_busy(false);
+    }
+}
+
+/// A stream running to a client. Dropped (at the stream's end, or as a panic unwinds
+/// the unit thread), it ends what the stream left: the writer's queue, the client's
+/// connection (so the client asks again, and a thread is started again for it), and
+/// the stream's values for `status`.
+struct Streaming<'a> {
+    info: &'a Info,
+    pipe: Arc<Pipe>,
+    shutter: Option<Conn>,
+}
+
+impl<'a> Streaming<'a> {
+    fn new(info: &'a Info, pipe: &Arc<Pipe>, conn: &Conn) -> Self {
+        Self {
+            info,
+            pipe: Arc::clone(pipe),
+            shutter: conn.try_clone().ok(),
+        }
+    }
+
+    /// Whether the client closed its end (also while nothing is written to it).
+    fn client_closed(&self) -> bool {
+        self.shutter.as_ref().is_some_and(peer_closed)
+    }
+}
+
+impl Drop for Streaming<'_> {
+    fn drop(&mut self) {
+        self.info.set_stream(None);
+        self.pipe.finish();
+        if let Some(conn) = &self.shutter {
+            let _ = conn.shutdown(std::net::Shutdown::Both);
+        }
     }
 }
 
 /// The writer thread: queue to client until the queue ends or the client is gone.
-fn write_ts(pipe: &Pipe, queue: &Receiver<Vec<u8>>, mut conn: UnixStream) {
+fn write_ts(pipe: &Pipe, queue: &Receiver<Vec<u8>>, mut conn: Conn) {
     for chunk in queue {
         if conn.write_all(&chunk).is_err() {
             pipe.closed.store(true, Ordering::Release);
             return;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn req(client: Option<&str>, if_free: bool) -> Request {
+        Request {
+            unit: String::new(),
+            tuning: Tuning::Terrestrial { hz: 557_142_857 },
+            sid: None,
+            mode: None,
+            client: client.map(str::to_owned),
+            if_free,
+        }
+    }
+
+    #[test]
+    fn a_stream_unwound_by_a_panic_ends() {
+        let path =
+            std::env::temp_dir().join(format!("dt295-unwind-test-{}.sock", std::process::id()));
+        let target = dt295::ipc::Target::Unix(path.clone());
+        let listener = dt295::ipc::listen(&target).expect("listen");
+        let mut client = dt295::ipc::connect(&target).expect("connect");
+        let conn = loop {
+            match dt295::ipc::accept(&listener) {
+                Ok(c) => break c,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(e) => panic!("accept: {e}"),
+            }
+        };
+        let info = Info::default();
+        let (pipe, queue) = Pipe::new();
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _busy = Busy::new(&info);
+            let _streaming = Streaming::new(&info, &pipe, &conn);
+            assert!(info.busy());
+            panic!("a bug in the stream");
+        }));
+        assert!(unwound.is_err());
+        assert!(!info.busy(), "not busy");
+        // the writer's queue ends, and the client sees the end of its stream
+        assert!(queue.recv().is_err());
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let mut rest = Vec::new();
+        std::io::Read::read_to_end(&mut client, &mut rest).expect("the end");
+        drop(conn);
+        dt295::ipc::unlisten(listener);
+        let mut lock = path.into_os_string();
+        lock.push(".lock");
+        let _ = std::fs::remove_file(lock);
+    }
+
+    #[test]
+    fn which_queued_request_goes() {
+        let (a, b) = (Some("1-1"), Some("2-1"));
+        // one that takes units over goes before a background one
+        assert!(other_goes(&req(a, true), &req(None, false), None));
+        // two background ones: the first, unless the other is the last client's
+        assert!(!other_goes(&req(a, true), &req(b, true), None));
+        assert!(other_goes(&req(a, true), &req(b, true), b));
+        assert!(!other_goes(&req(a, true), &req(b, true), a));
+        assert!(!other_goes(&req(None, true), &req(None, true), None));
     }
 }

@@ -1,20 +1,33 @@
 //! `BonDriver_DT295.ini` (next to the DLL, same base name), read under the Win32
 //! profile API's rules ([`dt295::profile`]).
 //!
-//! `[Tuner]`: `Firmware`, `TrcFirmware`, `DeviceIndex`, `DeviceSerial`, `StateFile`,
-//! `RawTS`, `ChannelFile` ([`dt295::bonini::Tuner`]), `LogFile`, `LogLevel`, `UHF`,
-//! `CATV`. `[BS]` / `[CS110]`: one `name=IF_kHz,TSID[,ServiceID]` line per channel. The
-//! `[Tuner]` keys of the unit and the tuning spaces ([`dt295::chan::ini_spaces`]: the
-//! ini's own, or those of the `ChannelFile`) are read by the shared code the `dt295`
-//! command reads the same file with.
+//! `[Tuner]`: `DeviceSerial`, `RawTS`, `ChannelFile` ([`dt295::bonini::Tuner`]),
+//! `LogFile`, `LogLevel`, `UHF`, `CATV`. `[BS]` / `[CS110]`: one
+//! `name=IF_kHz,TSID[,ServiceID]` line per channel. `[Server]`: `IdleExitSec`,
+//! `StartTimeoutSec` (the `dt295 serve` the DLL starts). The `[Tuner]` keys of the unit
+//! and the tuning spaces ([`dt295::chan::ini_spaces`]: the ini's own, or those of the
+//! `ChannelFile`) are read by the shared code the `dt295` command reads the same file
+//! with.
+//!
+//! The unit belongs to `dt295 serve`, whose firmware and state files are those of the
+//! DLL's folder: `Firmware`, `TrcFirmware`, `StateFile` and `DeviceIndex` of earlier
+//! versions are no longer read ([`dt295::bonini::RETIRED_KEYS`]).
 
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 
-use dt295::bonini::{DeviceSel, Tuner};
+use dt295::bonini::{Tuner, retired_keys};
 use dt295::chan::{self, Space};
 use dt295::profile::{self, Ini};
+use dt295::serve::Mode;
 use tracing::level_filters::LevelFilter;
+
+use crate::client::Settings;
+
+/// `[Server] IdleExitSec` by default: the daemon ends this long after its last client.
+pub const IDLE_EXIT_SECS: u32 = 5;
+/// `[Server] StartTimeoutSec` by default.
+pub const START_TIMEOUT_SECS: u32 = 5;
 
 /// Paths derived from the DLL's own file name.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -70,26 +83,23 @@ impl ModulePaths {
 /// What `LoadConfig` reads.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
-    /// The idle firmware (`[Tuner] Firmware`).
-    pub firmware: PathBuf,
-    /// The System1 transcoder firmware; `None` (an empty `TrcFirmware=`) = no stream
-    /// can start (the Rust port has only the System1 path).
-    pub trc_firmware: Option<PathBuf>,
-    /// Which device to open: `[Tuner] DeviceSerial`, else `DeviceIndex`.
-    pub device: DeviceSel,
+    /// The DLL's folder: `dt295.exe`, the firmware and the units' state files are there.
+    pub dir: PathBuf,
+    /// `[Tuner] DeviceSerial`; `None` = the only unit connected.
+    pub serial: Option<String>,
+    /// `[Tuner] RawTS`: non-zero = the blob-free raw-TS path -- the scrambled TS, for the
+    /// PC-side B-CAS (TVTest's CAS plugin) to descramble. Absent / 0 = the System1 path
+    /// (the vendor firmware, the device's internal B-CAS reader).
+    pub raw_ts: bool,
     /// `<dll>.log` with `[Tuner] LogFile=1`; `None` (absent or `0`) = OutputDebugString
     /// only.
     pub log_file: Option<PathBuf>,
     /// `[Tuner] LogLevel` (`error`, `warn`, `info`, `debug`, `trace`; absent or empty =
     /// `info`); `Err` holds a value that is none of them.
     pub log_level: Result<LevelFilter, String>,
-    /// `[Tuner] StateFile`: absent or empty = `<dll>.state`, else that file. Always
-    /// `Some` from an ini (it cannot be turned off); `None` only for a driver that must
+    /// `<dll>.ch2`, TVTest's channel-scan file (next to the DLL): read in raw-TS mode for a
+    /// known on-air channel to prime on at the open. `None` only for a driver that must
     /// not touch the disk (tests).
-    pub state_file: Option<PathBuf>,
-    /// `<dll>.ch2`, TVTest's channel-scan file (next to the DLL, independent of `StateFile`):
-    /// read in raw-TS mode to prime on a known on-air channel at the very first open. Always
-    /// `Some` from an ini; `None` only for a driver that must not touch the disk (tests).
     pub ch2_file: Option<PathBuf>,
     /// UHF, CATV (unless hidden), then BS and CS110 when they have lines; or the spaces of
     /// the `[Tuner] ChannelFile` (none when it cannot be read).
@@ -97,34 +107,29 @@ pub struct Config {
     /// What to log about the `ChannelFile` once the log is open: `Ok` lines (its format
     /// and spaces), or `Err` why it could not be read.
     pub channel_file_log: Result<Vec<String>, String>,
-    /// `[Tuner] RawTS`: non-zero = the blob-free raw-TS path -- the host brings the chip up,
-    /// tunes over the host-face I2C, arms the capture engine and runs its own TS pump (no
-    /// resident, no aux core, no vendor firmware), streaming the scrambled TS for the PC-side
-    /// B-CAS (TVTest's CAS plugin) to descramble. Absent / 0 = the System1 viewing path
-    /// (vendor firmware `Firmware` / `TrcFirmware`, the device's internal B-CAS reader).
-    pub raw_ts: bool,
+    /// `[Server] IdleExitSec`: the daemon this DLL starts ends after this long without a
+    /// client (0 = never).
+    pub idle_exit_secs: u32,
+    /// `[Server] StartTimeoutSec`: how long to wait for a daemon this DLL started.
+    pub start_timeout_secs: u32,
+    /// The `[Tuner]` keys of earlier versions the ini still has (not read).
+    pub retired: Vec<&'static str>,
 }
 
 impl Config {
     /// Read the configuration from a parsed ini (an empty one gives the defaults).
     pub fn from_ini(ini: &Ini, paths: &ModulePaths) -> Self {
-        // The firmware, the unit, the state file and RawTS: the dt295 command reads them
-        // from the same file with the same code. The state file cannot be turned off:
-        // without it a re-open loses the link key (no picture until a re-plug), every tune
-        // rediscovers its service, and uncontracted pay channels drop out of scans.
-        let tuner = Tuner::from_ini(ini, Path::new(&paths.dir), Path::new(&paths.stem));
+        // The unit, RawTS and the ChannelFile: the dt295 command reads them from the same
+        // file with the same code.
+        let tuner = Tuner::from_ini(ini, Path::new(&paths.dir));
 
-        // LogFile=1: the core log to <dll>.log, a fixed name -- one per DLL copy, and TVTest
-        // needs a copy of the DLL and ini per unit. Absent or 0 = no file.
+        // LogFile=1: the core log to <dll>.log, a fixed name -- one per DLL copy. Absent
+        // or 0 = no file.
         let log_file = (tuner_int(ini, "LogFile", 0) != 0).then(|| paths.sibling(".log"));
-        let log_level = match tuner_string(ini, "LogLevel").unwrap_or("").trim() {
+        let log_level = match profile::get(ini, "Tuner", "LogLevel").unwrap_or("").trim() {
             "" => Ok(LevelFilter::INFO),
             v => v.parse::<LevelFilter>().map_err(|_| v.to_owned()),
         };
-
-        // TVTest writes <dll>.ch2 next to the DLL, not next to a relocated StateFile, so derive
-        // it from the module path (the same sibling the log and the default state use).
-        let ch2_file = Some(paths.sibling(".ch2"));
 
         // A ChannelFile that cannot be read lists no spaces: the ini's own would number
         // the channels unlike the .ch2 made with that file.
@@ -135,23 +140,51 @@ impl Config {
         };
 
         Self {
-            firmware: tuner.firmware,
-            trc_firmware: tuner.trc_firmware,
-            device: tuner.device,
+            dir: folder(&paths.dir),
+            serial: tuner.serial,
+            raw_ts: tuner.raw_ts,
             log_file,
             log_level,
-            state_file: Some(tuner.state_file),
-            ch2_file,
+            // TVTest writes <dll>.ch2 next to the DLL
+            ch2_file: Some(paths.sibling(".ch2")),
             spaces,
             channel_file_log,
-            raw_ts: tuner.raw_ts,
+            idle_exit_secs: profile::get_int(ini, "Server", "IdleExitSec", IDLE_EXIT_SECS),
+            start_timeout_secs: profile::get_int(
+                ini,
+                "Server",
+                "StartTimeoutSec",
+                START_TIMEOUT_SECS,
+            ),
+            retired: retired_keys(ini),
+        }
+    }
+
+    /// What the client of `dt295 serve` needs.
+    pub fn settings(&self) -> Settings {
+        Settings {
+            dir: self.dir.clone(),
+            serial: self.serial.clone(),
+            mode: if self.raw_ts {
+                Mode::RawTs
+            } else {
+                Mode::System1
+            },
+            idle_exit_secs: u64::from(self.idle_exit_secs),
+            start_timeout_secs: u64::from(self.start_timeout_secs),
+            verbose: match self.log_level {
+                Ok(LevelFilter::TRACE) => 2,
+                Ok(LevelFilter::DEBUG) => 1,
+                _ => 0,
+            },
         }
     }
 }
 
-/// `GetPrivateProfileStringW(L"Tuner", key, ...)` ([`profile::get`]).
-fn tuner_string<'a>(ini: &'a Ini, key: &str) -> Option<&'a str> {
-    profile::get(ini, "Tuner", key)
+/// The folder of a module path's folder part (`...\BonDriver\`): without the trailing
+/// separator, unless it is a root.
+fn folder(dir: &OsStr) -> PathBuf {
+    Path::new(dir).components().collect()
 }
 
 /// `GetPrivateProfileIntW(L"Tuner", key, default)` ([`profile::get_int`]).
@@ -200,40 +233,39 @@ mod tests {
             p.sibling(".ini"),
             PathBuf::from(r"C:\TVTest\BonDriver\BonDriver_DT295.ini")
         );
-        // Relative paths are under the DLL folder.
-        let fw = |v: &str| config(&format!("[Tuner]\nFirmware={v}\n")).firmware;
-        assert_eq!(fw(r"D:\fw\a.bin"), PathBuf::from(r"D:\fw\a.bin"));
-        assert_eq!(fw(r"\\nas\fw\a.bin"), PathBuf::from(r"\\nas\fw\a.bin"));
-        assert_eq!(
-            fw(r"fw\a.bin"),
-            PathBuf::from(r"C:\TVTest\BonDriver\fw\a.bin")
-        );
         let none = ModulePaths::from_module_path(OsStr::new(""));
         assert_eq!(none.sibling(".ini"), PathBuf::from(".ini"));
+        assert_eq!(folder(&none.dir), PathBuf::new());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn the_folder() {
+        assert_eq!(config("").dir, PathBuf::from(r"C:\TVTest\BonDriver"));
+        let root = ModulePaths::from_module_path(OsStr::new(r"D:\BonDriver_DT295.dll"));
+        assert_eq!(
+            folder(&root.dir),
+            PathBuf::from(r"D:\"),
+            "a root keeps its separator"
+        );
     }
 
     #[test]
     fn defaults_without_ini() {
         let c = config("");
-        assert_eq!(
-            c.firmware,
-            PathBuf::from(r"C:\TVTest\BonDriver\mb86m01_assp_osec_idle.bin")
-        );
-        assert_eq!(
-            c.trc_firmware,
-            Some(PathBuf::from(
-                r"C:\TVTest\BonDriver\mb86m01_assp_osec_trc_m_h.bin"
-            ))
-        );
-        assert_eq!(c.device, DeviceSel::Index(0));
+        assert_eq!(c.serial, None, "the only unit");
+        assert!(!c.raw_ts);
         assert_eq!(c.log_file, None, "no LogFile key = no log file");
         assert_eq!(
-            c.state_file,
-            Some(PathBuf::from(r"C:\TVTest\BonDriver\BonDriver_DT295.state")),
-            "the state file is always on"
+            (c.idle_exit_secs, c.start_timeout_secs),
+            (IDLE_EXIT_SECS, START_TIMEOUT_SECS)
         );
+        assert!(c.retired.is_empty());
         let names: Vec<_> = c.spaces.iter().map(|s| s.name.as_str()).collect();
         assert_eq!(names, ["UHF", "CATV"]);
+        let s = c.settings();
+        assert_eq!((s.mode, s.verbose, s.idle_exit_secs), (Mode::System1, 0, 5));
+        assert_eq!(s.dir, c.dir);
     }
 
     #[test]
@@ -241,153 +273,79 @@ mod tests {
         let c = config(
             "\u{FEFF}; comment\r\n\
              [tuner]\r\n\
-             firmware = D:\\fw\\idle.bin\r\n\
-             TrcFirmware=\r\n\
-             DeviceIndex=2\r\n\
+             DeviceSerial= cd23456789 \r\n\
              LogFile=logs\\dt295core.log\r\n\
-             StateFile=\"C:\\state\\dt295.state\"\r\n\
+             RawTS=1\r\n\
              UHF=0\r\n\
              CATV=yes\r\n",
         );
-        assert_eq!(c.firmware, PathBuf::from(r"D:\fw\idle.bin"));
-        assert_eq!(c.trc_firmware, None);
-        assert_eq!(c.device, DeviceSel::Index(2));
+        assert_eq!(c.serial.as_deref(), Some("CD23456789"));
+        assert!(c.raw_ts);
+        assert_eq!(c.settings().mode, Mode::RawTs);
         // A path is not a flag: LogFile reads as 0 (as GetPrivateProfileInt would).
         assert_eq!(c.log_file, None);
-        assert_eq!(c.state_file, Some(PathBuf::from(r"C:\state\dt295.state")));
         // "yes" is not a number: GetPrivateProfileInt reads 0.
         assert!(c.spaces.is_empty());
     }
 
     #[test]
-    fn log_flag_and_state_file() {
+    fn log_flag() {
         let copy =
             ModulePaths::from_module_path(OsStr::new(r"C:\TVTest\BonDriver\BonDriver_DT295-1.dll"));
-        let files = |text: &str| {
-            let c = Config::from_ini(&profile::parse(text).expect("parses"), &copy);
-            (c.log_file, c.state_file)
-        };
-        let log = || Some(PathBuf::from(r"C:\TVTest\BonDriver\BonDriver_DT295-1.log"));
-        let state = || {
-            Some(PathBuf::from(
-                r"C:\TVTest\BonDriver\BonDriver_DT295-1.state",
-            ))
-        };
+        let log =
+            |text: &str| Config::from_ini(&profile::parse(text).expect("parses"), &copy).log_file;
         // LogFile: 1 = <dll>.log (named after the DLL copy); absent, empty or 0 = off.
         assert_eq!(
-            files(
-                "[Tuner]
-LogFile=1
-"
-            ),
-            (log(), state())
+            log("[Tuner]\nLogFile=1\n"),
+            Some(PathBuf::from(r"C:\TVTest\BonDriver\BonDriver_DT295-1.log"))
         );
         for off in [
             "",
-            "[Tuner]
-LogFile=
-",
-            "[Tuner]
-LogFile=0
-",
-            "[Tuner]
-;LogFile=1
-",
+            "[Tuner]\nLogFile=\n",
+            "[Tuner]\nLogFile=0\n",
+            "[Tuner]\n;LogFile=1\n",
+            "[BS]\nLogFile=1\n",
         ] {
-            assert_eq!(files(off).0, None, "{off:?}");
+            assert_eq!(log(off), None, "{off:?}");
         }
-        // StateFile: absent or empty = <dll>.state; a value = that file. Never off.
+        let verbose = |text: &str| config(text).settings().verbose;
+        assert_eq!(verbose("[Tuner]\nLogLevel=debug\n"), 1);
+        assert_eq!(verbose("[Tuner]\nLogLevel=trace\n"), 2);
+        assert_eq!(verbose("[Tuner]\nLogLevel=warn\n"), 0);
+    }
+
+    #[test]
+    fn server_section() {
+        let c = config("[Server]\r\nIdleExitSec=30\r\nStartTimeoutSec=9\r\n");
+        assert_eq!((c.idle_exit_secs, c.start_timeout_secs), (30, 9));
+        let s = c.settings();
+        assert_eq!((s.idle_exit_secs, s.start_timeout_secs), (30, 9));
         assert_eq!(
-            files(
-                "[Tuner]
-StateFile=
-"
-            )
-            .1,
-            state()
+            config("[Server]\nIdleExitSec=0\n").idle_exit_secs,
+            0,
+            "never"
         );
         assert_eq!(
-            files(
-                "[Tuner]
-;StateFile=
-"
-            )
-            .1,
-            state()
-        );
-        assert_eq!(
-            files(
-                "[Tuner]
-StateFile=BonDriver_DT295.state
-"
-            )
-            .1,
-            Some(PathBuf::from(r"C:\TVTest\BonDriver\BonDriver_DT295.state")),
-            "shared with another DLL of the same unit"
-        );
-        assert_eq!(
-            files(
-                "[Tuner]
-StateFile=-
-"
-            )
-            .1,
-            Some(PathBuf::from(r"C:\TVTest\BonDriver\-")),
-            "no switch-off value: '-' is just a file name"
-        );
-        // Only the [Tuner] section counts; the device selection does not name anything.
-        assert_eq!(
-            files(
-                "[BS]
-LogFile=1
-"
-            )
-            .0,
-            None
-        );
-        assert_eq!(
-            files(
-                "[Tuner]
-DeviceSerial=CD23456789
-"
-            )
-            .1,
-            state()
+            config("[Tuner]\nIdleExitSec=30\n").idle_exit_secs,
+            IDLE_EXIT_SECS,
+            "[Server] only"
         );
     }
 
     #[test]
-    fn device_selection() {
-        // A serial selects the unit, whatever DeviceIndex says.
+    fn retired_keys_are_not_read() {
         let c = config(
-            "[Tuner]
-DeviceIndex=1
-DeviceSerial= cd23456789 
-",
+            "[Tuner]\nFirmware=D:\\fw\\idle.bin\nTrcFirmware=\nDeviceIndex=2\nStateFile=x.state\n",
         );
-        assert_eq!(c.device, DeviceSel::Serial("CD23456789".into()));
-        assert_eq!(c.device.to_string(), "serial CD23456789");
         assert_eq!(
-            config(
-                "[Tuner]
-DeviceSerial=
-DeviceIndex=3
-"
-            )
-            .device,
-            DeviceSel::Index(3),
-            "empty = by index"
+            c.retired,
+            ["Firmware", "TrcFirmware", "DeviceIndex", "StateFile"]
         );
-        assert_eq!(DeviceSel::Index(3).to_string(), "DeviceIndex 3");
-        // An empty Firmware= is not the default (Win32: present but empty).
+        assert_eq!(c.serial, None, "DeviceIndex picks nothing");
         assert_eq!(
-            config(
-                "[Tuner]
-Firmware=
-"
-            )
-            .firmware,
-            PathBuf::from(r"C:\TVTest\BonDriver\")
+            c.settings().dir,
+            config("").dir,
+            "the firmware is the folder's"
         );
     }
 
@@ -449,5 +407,13 @@ Firmware=
         assert_eq!(line(2, "BS13/TS2"), (1_279_640_000, 0x46D2));
         assert_eq!(line(2, "BS01/TS1"), (1_049_480_000, 0x4011));
         assert_eq!(line(3, "ND06/TS0"), (1_693_000_000, 0x7060));
+    }
+    #[test]
+    fn the_sample_ini_has_no_retired_key() {
+        assert!(
+            config(include_str!("../BonDriver_DT295.ini"))
+                .retired
+                .is_empty()
+        );
     }
 }

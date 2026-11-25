@@ -2,28 +2,26 @@
 //! recorder's tuner command (Mirakurun / mirakc). It owns no device: when the recorder
 //! kills it, the socket closes and the daemon stops the stream properly.
 
-use std::fs::File;
-use std::io::{self, BufRead, BufReader, IsTerminal, Read, Write};
-use std::os::fd::{AsFd, AsRawFd};
-use std::os::unix::net::UnixStream;
+use std::io::{self, BufRead, BufReader, IsTerminal, Write};
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
 use clap::{ArgGroup, Args};
 
 use dt295::chan::NO_TSID;
+use dt295::ipc::{self, Conn};
 
-use crate::serve::conf::client_socket;
+use crate::serve::conf::client_target;
 use crate::serve::proto::{Reply, Request, Tuning};
 use crate::{parse_hex_u16, parse_u16, parse_u32};
 
 #[derive(Debug, Args)]
 #[command(group(ArgGroup::new("band").required(true).args(["ter", "sat"])))]
 pub struct TuneArgs {
-    /// The unit, by USB serial number (a [unit <serial>] of the daemon's configuration;
-    /// `--unit` is the same).
+    /// The unit, by USB serial number (`--unit` is the same); default: the only one
+    /// (configured, or connected).
     #[arg(long, alias = "unit", value_name = "SERIAL")]
-    pub serial: String,
+    pub serial: Option<String>,
 
     /// ISDB-T: the channel centre frequency in Hz (e.g. 557142857 for UHF 27ch).
     #[arg(long, value_name = "HZ", value_parser = parse_u32)]
@@ -50,15 +48,20 @@ pub struct TuneArgs {
     #[arg(long)]
     pub if_free: bool,
 
-    /// The configuration of `dt295 serve`, for its socket (default /etc/dt295.conf if
-    /// it exists).
+    /// The configuration of `dt295 serve`, for its socket (default /etc/dt295.conf on
+    /// Linux if it exists).
     #[arg(short, long, value_name = "FILE")]
     pub config: Option<PathBuf>,
 
-    /// The socket of `dt295 serve` (default: the configuration's, else
-    /// /run/dt295/dt295.sock).
+    /// The socket file of `dt295 serve` (default: $DT295_SOCKET, else the
+    /// configuration's, else /run/dt295/dt295.sock on Linux, %TEMP%\dt295-<hash of this
+    /// executable's folder>.sock on Windows).
     #[arg(long, value_name = "PATH")]
     pub socket: Option<PathBuf>,
+
+    /// The TCP address of `dt295 serve` instead (e.g. 127.0.0.1:41200; $DT295_LISTEN).
+    #[arg(long, value_name = "ADDR", conflicts_with = "socket")]
+    pub connect: Option<String>,
 }
 
 pub fn run(a: &TuneArgs) -> Result<()> {
@@ -73,19 +76,21 @@ pub fn run(a: &TuneArgs) -> Result<()> {
         },
         _ => bail!("give --ter or --sat"),
     };
-    let socket = client_socket(a.config.as_deref(), a.socket.as_deref())?;
+    let target = client_target(
+        a.config.as_deref(),
+        a.socket.as_deref(),
+        a.connect.as_deref(),
+    )?;
     let req = Request {
-        unit: a.serial.clone(),
+        unit: a.serial.clone().unwrap_or_default(),
         tuning,
         sid: a.sid,
+        mode: None,
+        client: None,
         if_free: a.if_free,
     };
-    let mut conn = UnixStream::connect(&socket).with_context(|| {
-        format!(
-            "cannot connect to dt295 serve at {} (is it running?)",
-            socket.display()
-        )
-    })?;
+    let mut conn = ipc::connect(&target)
+        .with_context(|| format!("cannot connect to dt295 serve at {target} (is it running?)"))?;
     conn.write_all(format!("{}\n", req.to_line()).as_bytes())
         .context("cannot send the request")?;
     let mut ts = BufReader::with_capacity(1 << 16, conn);
@@ -110,7 +115,12 @@ pub fn run(a: &TuneArgs) -> Result<()> {
 /// the daemon sends nothing until the service's PAT, so waiting for a write to fail
 /// could take for ever (45 min for a station off the air): poll sees the closed pipe
 /// at once. Written unbuffered: stdout's own buffer flushes at every 0x0A.
-fn pump(ts: BufReader<UnixStream>) -> io::Result<()> {
+#[cfg(unix)]
+fn pump(ts: BufReader<Conn>) -> io::Result<()> {
+    use std::fs::File;
+    use std::io::Read;
+    use std::os::fd::{AsFd, AsRawFd};
+
     let mut out = File::from(io::stdout().as_fd().try_clone_to_owned()?);
     out.write_all(ts.buffer())?;
     let sock = ts.into_inner();
@@ -152,4 +162,112 @@ fn pump(ts: BufReader<UnixStream>) -> io::Result<()> {
             out.write_all(&buf[..n])?;
         }
     }
+}
+
+/// Copy the TS to stdout until either end goes away. As on Unix, a reader that goes
+/// while the daemon sends nothing is not left waiting for a write to fail: while the
+/// socket is quiet, a write of no bytes to the pipe (which the reader of a byte pipe
+/// never sees) fails once it is gone.
+#[cfg(windows)]
+fn pump(ts: BufReader<Conn>) -> io::Result<()> {
+    use std::io::Read;
+
+    let mut out = io::stdout().lock();
+    out.write_all(ts.buffer())?;
+    out.flush()?;
+    let mut sock = ts.into_inner();
+    let mut buf = vec![0u8; 1 << 16];
+    loop {
+        if !readable(&sock, 1)? {
+            if stdout_reader_gone() {
+                return Ok(());
+            }
+            continue;
+        }
+        let n = match sock.read(&mut buf) {
+            Ok(n) => n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        };
+        if n == 0 {
+            return Ok(()); // the daemon ended the stream
+        }
+        out.write_all(&buf[..n])?;
+        out.flush()?;
+    }
+}
+
+/// Whether `sock` has something to read (or its end) within `secs` seconds.
+#[cfg(windows)]
+fn readable(sock: &Conn, secs: i32) -> io::Result<bool> {
+    use std::os::windows::io::AsRawSocket;
+    use windows_sys::Win32::Networking::WinSock::{
+        FD_SET, SOCKET, TIMEVAL, WSAGetLastError, select,
+    };
+
+    let mut set = FD_SET {
+        fd_count: 1,
+        fd_array: [0; 64],
+    };
+    set.fd_array[0] = sock.as_raw_socket() as SOCKET;
+    let wait = TIMEVAL {
+        tv_sec: secs,
+        tv_usec: 0,
+    };
+    // SAFETY: one valid socket in the set, and a timeout.
+    let n = unsafe {
+        select(
+            0,
+            &mut set,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &wait,
+        )
+    };
+    if n < 0 {
+        // SAFETY: no arguments; the error of the call above.
+        return Err(io::Error::from_raw_os_error(unsafe { WSAGetLastError() }));
+    }
+    Ok(n > 0)
+}
+
+/// Whether the reader of stdout, a pipe, is gone: a write of no bytes fails then
+/// (`ERROR_NO_DATA`, `ERROR_BROKEN_PIPE`, `ERROR_PIPE_NOT_CONNECTED` once the server of a
+/// named pipe disconnected). Not a pipe, or a message pipe: never (the reader of a
+/// message pipe reads the write of no bytes as a message, and may take it for the end).
+/// A pipe whose kind cannot be had (the server end of an outbound named pipe) is taken
+/// for a byte pipe.
+#[cfg(windows)]
+fn stdout_reader_gone() -> bool {
+    use windows_sys::Win32::Foundation::{
+        ERROR_BROKEN_PIPE, ERROR_NO_DATA, ERROR_PIPE_NOT_CONNECTED, GetLastError,
+    };
+    use windows_sys::Win32::Storage::FileSystem::{FILE_TYPE_PIPE, GetFileType, WriteFile};
+    use windows_sys::Win32::System::Console::{GetStdHandle, STD_OUTPUT_HANDLE};
+    use windows_sys::Win32::System::Pipes::{GetNamedPipeInfo, PIPE_TYPE_MESSAGE};
+
+    // SAFETY: no arguments but the constant.
+    let h = unsafe { GetStdHandle(STD_OUTPUT_HANDLE) };
+    // SAFETY: a handle (or an invalid one, which is no pipe).
+    if unsafe { GetFileType(h) } != FILE_TYPE_PIPE {
+        return false;
+    }
+    let mut flags = 0u32;
+    let none = std::ptr::null_mut();
+    // SAFETY: a pipe handle, a place for its flags, and no other places asked for.
+    if unsafe { GetNamedPipeInfo(h, &mut flags, none, none, none) } != 0
+        && flags & PIPE_TYPE_MESSAGE != 0
+    {
+        return false;
+    }
+    let none = [0u8; 1];
+    let mut written = 0u32;
+    // SAFETY: a valid buffer of which no bytes are written, and a place for the count.
+    let ok = unsafe { WriteFile(h, none.as_ptr(), 0, &mut written, std::ptr::null_mut()) };
+    // SAFETY: no arguments; the error of the call above.
+    ok == 0
+        && matches!(
+            unsafe { GetLastError() },
+            ERROR_NO_DATA | ERROR_BROKEN_PIPE | ERROR_PIPE_NOT_CONNECTED
+        )
 }

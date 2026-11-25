@@ -261,7 +261,13 @@ pub fn run_cold_stream(
     sink: &mut TsSink,
     cn_report: Option<&dyn Fn(i32)>,
 ) -> Result<RawCaptureStats> {
-    let locked = crate::fjcore::cold_prepare_stream(io, terrestrial, freq_hz, tsid, full)?;
+    let status = crate::fjcore::cold_prepare_stream(io, terrestrial, freq_hz, tsid, full)?;
+    let locked = status.locked;
+    if locked && let Some(report) = cn_report {
+        // The C/N of the lock, at once: the first periodic read is a second away, and the host
+        // may want a level as soon as the TS flows (the daemon's reply, say).
+        report(status.cn_mdb);
+    }
     info!(
         "raw-TS cold: {} at {:.3} MHz",
         if locked { "locked" } else { "NO LOCK" },

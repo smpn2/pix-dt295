@@ -33,7 +33,9 @@ mod watch;
 
 pub use device::{Device, KeyJournal, Live};
 pub use dt295_core::fwdl::{IDLE_FIRMWARE, TRC_FIRMWARE};
-pub use dt295_core::{Error, Result, Status, System, TsSink, bonini, chan, error, profile};
+pub use dt295_core::{
+    Error, Result, Status, System, TsSink, bonini, chan, error, ipc, profile, serve,
+};
 pub use dt295_rawfw::{RAW_FIRST_TS, RAW_STALL, RAW_STREAM_CAP, RawCaptureStats, raw_stall_due};
 pub use dt295_usb::Listed;
 pub use watch::{CardWatch, StallWatch, StartOver};

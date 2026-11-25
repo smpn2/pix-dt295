@@ -75,9 +75,14 @@ pub struct MirakcArgs {
     #[arg(short, long, value_name = "FILE", conflicts_with = "bondriver", hide = cfg!(not(unix)))]
     pub config: Option<PathBuf>,
 
-    /// (Linux) The socket of `dt295 serve` (default: the configuration's).
+    /// (Linux) The socket file of `dt295 serve` (default: $DT295_SOCKET, else the
+    /// configuration's, else /run/dt295/dt295.sock).
     #[arg(long, value_name = "PATH", conflicts_with = "bondriver", hide = cfg!(not(unix)))]
     pub socket: Option<PathBuf>,
+
+    /// (Linux) The TCP address of `dt295 serve` instead ($DT295_LISTEN).
+    #[arg(long, value_name = "ADDR", conflicts_with_all = ["bondriver", "socket"], hide = cfg!(not(unix)))]
+    pub connect: Option<String>,
 
     /// One channel per service, each tuning that service only (`dt295 tune --sid`);
     /// default: one channel per TS, streaming every service of it.
@@ -146,8 +151,12 @@ fn from_tvtest(ini: &Path, ch2: Option<&Path>) -> Result<(Vec<Channel>, Vec<Stri
 
 #[cfg(unix)]
 fn from_scan(a: &MirakcArgs, serial: &str) -> Result<(Vec<Channel>, Vec<String>, String)> {
-    let socket = crate::serve::conf::client_socket(a.config.as_deref(), a.socket.as_deref())?;
-    let (channels, skipped) = scan::run(serial, a.catv, a.on_air, &socket)?;
+    let target = crate::serve::conf::client_target(
+        a.config.as_deref(),
+        a.socket.as_deref(),
+        a.connect.as_deref(),
+    )?;
+    let (channels, skipped) = scan::run(serial, a.catv, a.on_air, &target)?;
     Ok((channels, skipped, format!("a scan with {serial}")))
 }
 

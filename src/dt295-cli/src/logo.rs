@@ -263,9 +263,9 @@ fn receive(a: &LogoArgs, tv: &TvTest) -> Result<Collector> {
     Ok(std::mem::take(&mut *lock(&shared)))
 }
 
-/// A free unit (only `only` if given) with its BonDriver's firmware and state file, and
-/// whether that ini is on the raw-TS path (`RawTS=1`: boot nothing, as the BonDriver).
-/// An ini without a trc firmware (`TrcFirmware=`) is an error: no stream can start.
+/// A free unit (only `only` if given) with the firmware and the state file of its
+/// BonDriver's folder, and whether that ini is on the raw-TS path (`RawTS=1`: boot
+/// nothing, as the BonDriver).
 fn choose(bons: &[BonDriver], only: Option<&str>) -> Result<Option<(DeviceArgs, bool)>> {
     let units = dt295::list().context("enumerate USB devices")?;
     let free: Vec<String> = units
@@ -279,23 +279,18 @@ fn choose(bons: &[BonDriver], only: Option<&str>) -> Result<Option<(DeviceArgs, 
     };
     let files = bon.unwrap_or(&bons[0]);
     let raw = files.tuner.raw_ts;
-    if !raw && files.tuner.trc_firmware.is_none() {
-        bail!(
-            "{}: TrcFirmware is empty, so no stream can start (as in the BonDriver)",
-            files.ini.display()
-        );
-    }
     let path = if raw { ", raw-TS" } else { "" };
     match bon {
         Some(b) => println!("using unit {serial} ({}{path})", b.ini.display()),
         None => println!("using unit {serial} (no BonDriver ini names it{path})"),
     }
     let dev = DeviceArgs {
-        fw: Some(files.tuner.firmware.clone()),
-        trc: files.tuner.trc_firmware.clone(),
+        fw: Some(files.tuner.firmware()),
+        trc: Some(files.tuner.trc_firmware()),
         index: 0,
+        state: Some(files.tuner.state_file(&serial)),
+        state_dir: None,
         serial: Some(serial),
-        state: bon.map(|b| b.tuner.state_file.clone()),
     };
     Ok(Some((dev, raw)))
 }

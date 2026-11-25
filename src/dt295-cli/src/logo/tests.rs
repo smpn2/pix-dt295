@@ -695,15 +695,19 @@ fn bondriver_ini() {
     )
     .unwrap();
     assert_eq!(b.serial(), Some("EF34567890"));
-    assert_eq!(b.tuner.firmware, dir.join("mb86m01_assp_osec_idle.bin"));
-    assert_eq!(b.tuner.trc_firmware, Some(dir.join("fw\\trc.bin")));
-    assert_eq!(b.tuner.state_file, dir.join("BonDriver_DT295-1.state"));
+    assert_eq!(b.tuner.firmware(), dir.join("mb86m01_assp_osec_idle.bin"));
+    assert_eq!(
+        b.tuner.trc_firmware(),
+        dir.join("mb86m01_assp_osec_trc_m_h.bin"),
+        "the folder's, whatever TrcFirmware says"
+    );
+    assert_eq!(
+        b.tuner.state_file("EF34567890"),
+        dir.join("EF34567890.state")
+    );
 
     let b = BonDriver::from_ini(&ini, "[tuner]\nDeviceSerial=\nStateFile=shared.state\n").unwrap();
-    assert_eq!(
-        (b.serial(), &b.tuner.state_file),
-        (None, &dir.join("shared.state"))
-    );
+    assert_eq!(b.serial(), None);
 }
 
 #[test]

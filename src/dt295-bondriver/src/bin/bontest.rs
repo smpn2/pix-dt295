@@ -13,19 +13,20 @@
 //!                                                  e.g. `scan 2:0 0` = BS ch 0, then all of UHF
 //! bontest <BonDriver.dll> idle [seconds]
 //!                                                  open, hold the tuner without a channel
-//!                                                  (default 60 s), close: the idle keeper's
-//!                                                  work (keepalive, unplug and re-plug)
+//!                                                  (default 60 s), close: dt295 serve stays
+//!                                                  while the tuner is open
 //! bontest <BonDriver.dll> reopen <space> <ch> [seconds] [pause]
 //!                                                  open, tune, stream, close, then after
 //!                                                  `pause` s (default 90) all again with the
 //!                                                  DLL still loaded: a host that keeps it
-//!                                                  (what another program did to the state
-//!                                                  file meanwhile)
+//!                                                  (dt295 serve ended and started again
+//!                                                  meanwhile)
 //! ```
 //!
-//! The second form needs the device bound to WinUSB and the firmware next to the DLL
-//! (or the path in its ini). Give the DLL as an absolute path: LoadLibrary looks for a
-//! bare or relative name next to bontest.exe first.
+//! The DLL watches through `dt295 serve`: the forms that open the tuner need dt295.exe
+//! next to the DLL (it starts one when none answers), and to stream, the device bound to
+//! WinUSB and the firmware there too. Give the DLL as an absolute path: LoadLibrary looks
+//! for a bare or relative name next to bontest.exe first.
 
 #[cfg(all(windows, target_env = "msvc"))]
 fn main() -> std::process::ExitCode {
@@ -303,8 +304,7 @@ mod host {
     }
 
     /// `idle`: open the tuner and hold it `secs` without a channel, then close it: what a
-    /// host does between viewing (the driver's idle keeper runs meanwhile; its log says
-    /// what it noticed, an unplug among them).
+    /// host does between viewing (dt295 serve stays meanwhile, and ends after the close).
     unsafe fn idle(bon: Bon, secs: u64) -> ExitCode {
         // SAFETY: see the caller.
         unsafe {

@@ -46,7 +46,7 @@ const UTF8_BOM: &[u8] = b"\xEF\xBB\xBF";
 /// `dt295 lineup` options.
 #[derive(Debug, Args)]
 pub struct LineupArgs {
-    /// A state file (BonDriver_DT295.state, or dt295 serve's <serial>.state).
+    /// A state file (dt295 serve's <serial>.state, or an older BonDriver_DT295.state).
     pub state: PathBuf,
 
     /// Channel file with the service names for the comments (default: the --bondriver
@@ -303,8 +303,8 @@ fn read_ch2(path: &Path) -> io::Result<ChannelNames> {
 }
 
 /// The default `.ch2`, the first that exists: TVTest writes it next to the DLL with the
-/// DLL's name, as the ini has (`--bondriver`), which a relocated `StateFile` or `dt295
-/// serve`'s `<serial>.state` does not; else the state file's name with `.ch2`.
+/// DLL's name, as the ini has (`--bondriver`), which `dt295 serve`'s `<serial>.state` does
+/// not; else the state file's name with `.ch2`.
 fn default_ch2(state: &Path, bondriver: Option<&Path>) -> Option<PathBuf> {
     bondriver
         .into_iter()

@@ -32,11 +32,8 @@ mod mirakc;
 mod rawts;
 mod reg;
 mod sections;
-// the configuration and the protocol build everywhere (their tests run on Windows too)
-#[cfg_attr(not(unix), allow(dead_code))]
 mod serve;
 mod state_show;
-#[cfg(unix)]
 mod tune;
 mod tuner;
 
@@ -62,9 +59,9 @@ enum Command {
     /// Boot the device, tune, and write the TS (every service, or the one of --sid) to a
     /// file or stdout; with --raw-ts the scrambled TS, booting nothing.
     Capture(CaptureArgs),
-    /// List the connected PIX-DT295 units: DeviceIndex, USB serial number, whether free.
+    /// List the connected PIX-DT295 units: index, USB serial number, whether free.
     List,
-    /// Inspect a state file (BonDriver_DT295.state, or dt295 serve's <serial>.state).
+    /// Inspect a state file (dt295 serve's <serial>.state, or an older BonDriver_DT295.state).
     State {
         #[command(subcommand)]
         command: StateCommand,
@@ -86,11 +83,10 @@ enum Command {
     /// The channels of a mirakc configuration: from a TVTest channel scan (.ch2 and its ini),
     /// or (Linux) from a scan through `dt295 serve`.
     MirakcChannels(mirakc::MirakcArgs),
-    /// Hold the units of /etc/dt295.conf open and stream to `dt295 tune` clients.
-    #[cfg(unix)]
+    /// Hold units open and stream to `dt295 tune` clients and the BonDriver (the units of
+    /// the configuration, or each unit a request asks for).
     Serve(serve::ServeArgs),
     /// Ask `dt295 serve` for a stream and write its TS to stdout (a recorder's tuner command).
-    #[cfg(unix)]
     Tune(tune::TuneArgs),
 }
 
@@ -231,9 +227,7 @@ fn main() -> ExitCode {
         Command::Reg(args) => reg::run(&args),
         Command::EtwUrbs(args) => etw::run(&args),
         Command::MirakcChannels(args) => mirakc::run(&args),
-        #[cfg(unix)]
         Command::Serve(args) => serve::run(&args),
-        #[cfg(unix)]
         Command::Tune(args) => tune::run(&args),
     };
     match result {

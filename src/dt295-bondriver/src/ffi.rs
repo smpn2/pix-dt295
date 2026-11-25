@@ -274,7 +274,7 @@ unsafe extern "C" fn purge_ts_stream(ctx: *mut c_void) {
     });
 }
 
-/// `Release`: drops the driver (closes the tuner, joins the idle keeper, flushes
+/// `Release`: drops the driver (closes the tuner, joins the client's threads, flushes
 /// and closes the log); the shim deletes itself afterwards.
 unsafe extern "C" fn release(ctx: *mut c_void) {
     guard((), || {

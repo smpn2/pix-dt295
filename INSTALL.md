@@ -95,8 +95,10 @@ cargo build --release -p dt295-cli --target aarch64-apple-darwin  # ARM64
 
    純正のアプリ (StationTV X) に戻すときは `dt295 driver restore`。
 
-2. TVTest の BonDriver のフォルダーに、`BonDriver_DT295.dll`, `BonDriver_DT295.ini` (見本はリリースの zip と `src/dt295-bondriver/BonDriver_DT295.ini`), ファームウェア 2 つを置く。
-   ini は DLL と同じ名前にし、`[Tuner] DeviceSerial` に使う個体のシリアル番号を書く。
+2. TVTest の BonDriver のフォルダーに、`BonDriver_DT295.dll`, `BonDriver_DT295.ini` (見本はリリースの zip と `src/dt295-bondriver/BonDriver_DT295.ini`), `dt295.exe`, ファームウェア 2 つを置く。
+   ini は DLL と同じ名前にする。
+   個体が 1 台なら設定は要らず、複数台のときは `[Tuner] DeviceSerial` に使う個体のシリアル番号を書く。
+   BonDriver は同じフォルダーの `dt295.exe` (`dt295 serve`) を起動して個体を扱わせ、TVTest を閉じると `dt295 serve` も終わる。
 
 3. TVTest でドライバーに `BonDriver_DT295.dll` を選び、チャンネルスキャンする。
    地デジと、見本の ini の BS / CS は、TS の全サービスが登録される。
@@ -113,14 +115,16 @@ cargo build --release -p dt295-cli --target aarch64-apple-darwin  # ARM64
 
    ロゴが送出されていない時期は受信できずに終了するので、日を置いて実行する。
 
-更新するときは、TVTest を閉じて DLL を置き換える (ini と状態ファイルはそのまま使える)。
+更新するときは、TVTest をすべて閉じて (数秒で `dt295 serve` も終わる)、DLL と `dt295.exe` を置き換える (ini と状態ファイルはそのまま使える)。
+個体を TVTest の中で直接開いていた版 (0.5.0 まで) から更新するときは、状態ファイルの名前を `BonDriver_DT295.state` から `<シリアル番号>.state` (例 `CD23456789.state`) に変える。
+変えなくても動くが、そのときは最初に復号できないことがあり、個体の抜き差しで直る。
 
 詳しくは [docs/usage.md](docs/usage.md) の "BonDriver (TVTest)", "`dt295 driver`", "`dt295 logo`", "困ったとき" セクション。
 
 ## Windows: raw-TS モード (任意)
 
 System1 モードがデバイスの中でデスクランブルするのに対し、raw-TS モードはスクランブルされたままの TS を TVTest に渡し、解除は TVTest の CAS プラグインに任せる。
-ini の `[Tuner] RawTS=1` で切り替わる。内部の仕組みと機能差は [docs/raw-ts.md](docs/raw-ts.md)。
+ini の `[Tuner] RawTS=1` で切り替わる (切り替えたら、TVTest をすべて閉じてから開き直す)。内部の仕組みと機能差は [docs/raw-ts.md](docs/raw-ts.md)。
 
 - ファームウェアは要らない。レジデント (チップに常駐させる第三者のコード) も補助コア (demod を動かす副 CPU) も純正ファームも使わず、ホストがチップを cold (電源投入直後) から自力で立ち上げる (完全に自前コードのみ)
 - B-CAS の解除は TVTest 側 (CAS プラグインと PC/SC リーダーの契約済みカード) が行う。System1 と違い、デバイスのスロットのカードは使わない

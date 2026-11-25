@@ -40,6 +40,9 @@ windows-sys = { workspace = true, features = [
     "Win32_System_SystemInformation",
     "Win32_System_Threading",
     "Win32_UI_Shell",
+    # dt295 tune: waiting on the socket while it watches its stdout's reader
+    "Win32_Networking_WinSock",
+    "Win32_System_Pipes",
 ] }
 
 [build-dependencies]

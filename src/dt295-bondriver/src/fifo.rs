@@ -1,5 +1,5 @@
-//! The TS FIFO between the core's stream worker (producer, via the `TsSink`) and the
-//! host's `GetTsStream` calls: a fixed ring buffer that drops the oldest bytes when
+//! The TS FIFO between the stream from `dt295 serve` (producer, via the `TsSink`) and
+//! the host's `GetTsStream` calls: a fixed ring buffer that drops the oldest bytes when
 //! the host does not read in time, counting what it dropped.
 
 use std::sync::{Condvar, Mutex, MutexGuard, PoisonError};
@@ -25,9 +25,6 @@ struct Ring {
     len: usize,
     /// Bytes lost to overflow since the last [`TsFifo::take_dropped`].
     dropped: u64,
-    /// Total bytes ever pushed (monotonic): a stream-liveness signal -- it stops
-    /// advancing when the worker stops delivering TS (see [`TsFifo::received`]).
-    received: u64,
 }
 
 impl TsFifo {
@@ -40,7 +37,6 @@ impl TsFifo {
                 head: 0,
                 len: 0,
                 dropped: 0,
-                received: 0,
             }),
             ready: Condvar::new(),
         }
@@ -76,7 +72,6 @@ impl TsFifo {
         r.buf[tail..tail + first].copy_from_slice(&data[..first]);
         r.buf[..n - first].copy_from_slice(&data[first..]);
         r.len += n;
-        r.received += n as u64;
         drop(r);
         self.ready.notify_all();
     }
@@ -146,13 +141,6 @@ impl TsFifo {
     /// Bytes dropped by overflow since the last call; resets the counter.
     pub fn take_dropped(&self) -> u64 {
         std::mem::take(&mut self.lock().dropped)
-    }
-
-    /// Total bytes ever pushed (monotonic). A stream-liveness signal: it stops advancing
-    /// when the worker stops delivering TS (a stalled datapath), which the idle keeper
-    /// uses to notice a dead stream the worker itself cannot report.
-    pub fn received(&self) -> u64 {
-        self.lock().received
     }
 }
 
@@ -236,29 +224,6 @@ mod tests {
         f.push(&[0, 1, 2, 3, 4, 5, 6, 7, 8, 9]);
         assert_eq!(f.take_dropped(), 7);
         assert_eq!(pop_all(&f), [6, 7, 8, 9]);
-    }
-
-    #[test]
-    fn received_totals_every_byte_pushed() {
-        let f = TsFifo::new(4);
-        assert_eq!(f.received(), 0);
-        f.push(&[1, 2, 3]);
-        assert_eq!(f.received(), 3);
-        f.push(&[]); // an empty push is a no-op
-        assert_eq!(f.received(), 3);
-        // Overflow drops the oldest bytes, but every pushed byte still counts as received.
-        f.push(&[4, 5, 6]);
-        assert_eq!(f.received(), 6);
-        // Popping does not move the received total (it only tracks the producer side).
-        let mut b = [0u8; 2];
-        f.pop(&mut b);
-        assert_eq!(f.received(), 6);
-        // An oversized push counts the bytes that enter the ring (its newest `cap`).
-        f.push(&[10, 11, 12, 13, 14, 15]);
-        assert_eq!(f.received(), 10);
-        // purge clears buffered data but keeps the monotonic received total.
-        f.purge();
-        assert_eq!(f.received(), 10);
     }
 
     #[test]

@@ -1,8 +1,8 @@
 //! A BonDriver_DT295 ini as the configuration of `dt295 capture`, `dt295 logo` and
-//! `dt295 mirakc-channels`, read with the BonDriver's own code: `[Tuner]` gives the
-//! firmware, the unit (`DeviceSerial`, else `DeviceIndex`) and the state file
-//! ([`dt295::bonini::Tuner`]: paths are relative to the ini's folder, and the state file
-//! is named after the ini unless `StateFile` says otherwise), and the tuning spaces are
+//! `dt295 mirakc-channels`, read with the BonDriver's own code: `[Tuner]` gives the unit
+//! (`DeviceSerial`) and the raw-TS switch, the firmware and the state file are those of
+//! the ini's folder, as the `dt295 serve` the BonDriver starts uses them
+//! ([`dt295::bonini::Tuner`]: the state file is `<serial>.state`), and the tuning spaces are
 //! [`chan::ini_spaces`] (the built-in UHF `13ch`..`62ch` and CATV `C13ch`..`C63ch` plus
 //! the `[BS]` / `[CS110]` lines, or those of the `ChannelFile`), so a TVTest `.ch2` made
 //! with the ini numbers them the same. On Linux, where there is no DLL, a file of the
@@ -12,7 +12,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use dt295::bonini::{DeviceSel, Tuner};
+use dt295::bonini::{Tuner, retired_keys};
 use dt295::chan::{self, Channel, NO_TSID, Space};
 use dt295::{System, profile};
 
@@ -22,8 +22,8 @@ use crate::tuner::DeviceArgs;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BonDriver {
     pub ini: PathBuf,
-    /// `[Tuner]`: the firmware, the unit, the state file (with the link key the unit last
-    /// used).
+    /// `[Tuner]`: the unit, the raw-TS switch, the folder of the firmware and the state
+    /// file (with the link key the unit last used).
     pub tuner: Tuner,
     /// The tuning spaces, in the BonDriver's order.
     pub spaces: Vec<Space>,
@@ -34,7 +34,14 @@ impl BonDriver {
         let parsed =
             profile::parse(text).with_context(|| format!("cannot parse {}", ini.display()))?;
         let dir = ini.parent().unwrap_or(Path::new(""));
-        let tuner = Tuner::from_ini(&parsed, dir, &ini.with_extension(""));
+        let tuner = Tuner::from_ini(&parsed, dir);
+        for key in retired_keys(&parsed) {
+            tracing::warn!(
+                "{}: [Tuner] {key} is no longer read (the firmware and the state file are \
+                 those of the ini's folder)",
+                ini.display()
+            );
+        }
         // As the BonDriver: a ChannelFile that cannot be read gives no tuning spaces (the
         // ini still names the unit and its state file, which `dt295 logo` needs).
         let spaces = match chan::ini_spaces(&parsed, tuner.channel_file.as_deref()) {
@@ -83,39 +90,30 @@ impl BonDriver {
 
     /// The unit's serial number when the ini names one (`DeviceSerial`).
     pub fn serial(&self) -> Option<&str> {
-        match &self.tuner.device {
-            DeviceSel::Serial(s) => Some(s),
-            DeviceSel::Index(_) => None,
-        }
+        self.tuner.serial.as_deref()
     }
 
     /// The device options this ini gives, with the ones given on the command line
-    /// winning (an explicit `-i` also wins over the ini's `DeviceSerial`). An empty
-    /// `TrcFirmware=` gives none: no stream can start, as in the BonDriver.
+    /// winning (an explicit `-i` also wins over the ini's `DeviceSerial`): the firmware
+    /// in the ini's folder, and the unit's state file there unless `--state` names one.
     pub fn device_args(&self, given: &DeviceArgs) -> DeviceArgs {
         let explicit_index = given.index != 0;
-        let index = match self.tuner.device {
-            DeviceSel::Index(n) => n,
-            DeviceSel::Serial(_) => 0,
-        };
         DeviceArgs {
-            fw: given
-                .fw
-                .clone()
-                .or_else(|| Some(self.tuner.firmware.clone())),
+            fw: given.fw.clone().or_else(|| Some(self.tuner.firmware())),
             trc: given
                 .trc
                 .clone()
-                .or_else(|| self.tuner.trc_firmware.clone()),
-            index: if explicit_index { given.index } else { index },
+                .or_else(|| Some(self.tuner.trc_firmware())),
+            index: given.index,
             serial: given
                 .serial
                 .clone()
                 .or_else(|| self.serial().filter(|_| !explicit_index).map(str::to_owned)),
-            state: given
-                .state
+            state: given.state.clone(),
+            state_dir: given
+                .state_dir
                 .clone()
-                .or_else(|| Some(self.tuner.state_file.clone())),
+                .or_else(|| Some(self.tuner.dir.clone())),
         }
     }
 }
@@ -163,7 +161,7 @@ mod tests {
     const INI: &str = "[Tuner]\r\n\
         DeviceIndex=2\r\n\
         TrcFirmware=\"fw\\trc.bin\"\r\n\
-        ; StateFile=x\r\n\
+        ; DeviceSerial=x\r\n\
         [BS]  ; satellite\r\n\
         BS15/101=1318000,0x40F1,101\r\n\
         BS01/151=1049480,0x4010\r\n\
@@ -185,10 +183,14 @@ mod tests {
     fn tuner_section() {
         let b = ini();
         let dir = Path::new("cfg");
-        assert_eq!((b.serial(), &b.tuner.device), (None, &DeviceSel::Index(2)));
-        assert_eq!(b.tuner.firmware, dir.join("mb86m01_assp_osec_idle.bin"));
-        assert_eq!(b.tuner.trc_firmware, Some(dir.join("fw\\trc.bin")));
-        assert_eq!(b.tuner.state_file, dir.join("dt295.state"));
+        assert_eq!(b.serial(), None);
+        assert_eq!(b.tuner.firmware(), dir.join("mb86m01_assp_osec_idle.bin"));
+        assert_eq!(
+            b.tuner.trc_firmware(),
+            dir.join("mb86m01_assp_osec_trc_m_h.bin"),
+            "TrcFirmware is no longer read"
+        );
+        assert_eq!(b.tuner.state_file("ab1"), dir.join("AB1.state"));
         use SpaceKind::*;
         assert_eq!(kinds(&b), [Uhf, Catv, Bs, Cs110]);
         assert_eq!(
@@ -261,11 +263,18 @@ mod tests {
             index: 0,
             serial: None,
             state: None,
+            state_dir: None,
         };
         let d = b.device_args(&none);
         assert_eq!(d.serial.as_deref(), Some("EF34567890"));
-        assert_eq!(d.state, Some(PathBuf::from("s.state")));
+        assert_eq!(d.state, None, "StateFile is no longer read");
+        assert_eq!(d.state_dir, Some(PathBuf::new()), "the ini's folder");
         assert_eq!(d.fw, Some(PathBuf::from("mb86m01_assp_osec_idle.bin")));
+        let d = b.device_args(&DeviceArgs {
+            state: Some("given.state".into()),
+            ..none.clone()
+        });
+        assert_eq!(d.state, Some(PathBuf::from("given.state")));
 
         let given = DeviceArgs {
             fw: Some("f".into()),
@@ -288,15 +297,14 @@ mod tests {
             index: 0,
             serial: None,
             state: None,
+            state_dir: None,
         };
-        // An empty TrcFirmware= is none (no stream can start), not the default file.
-        assert_eq!(b("[Tuner]\nTrcFirmware=\n").device_args(&none).trc, None);
-        // DeviceIndex as GetPrivateProfileInt: 010 is ten, a negative one opens nothing.
-        assert_eq!(b("[Tuner]\nDeviceIndex=010\n").device_args(&none).index, 10);
+        // TrcFirmware and DeviceIndex are no longer read
         assert_eq!(
-            b("[Tuner]\nDeviceIndex=-1\n").device_args(&none).index,
-            usize::MAX
+            b("[Tuner]\nTrcFirmware=\n").device_args(&none).trc,
+            Some(PathBuf::from("mb86m01_assp_osec_trc_m_h.bin"))
         );
+        assert_eq!(b("[Tuner]\nDeviceIndex=3\n").device_args(&none).index, 0);
         // DeviceSerial: blanks trimmed (inside quotes too), upper case.
         let d = b("[Tuner]\nDeviceSerial=\" ef34567890 \"\n").device_args(&none);
         assert_eq!(d.serial.as_deref(), Some("EF34567890"));

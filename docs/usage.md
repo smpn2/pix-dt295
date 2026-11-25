@@ -1,9 +1,24 @@
 # リファレンス
 
-BonDriver と ini、`dt295` の各コマンド、Linux のデーモンの設定の説明。
+BonDriver と ini、`dt295` の各コマンド、デーモン (`dt295 serve`) の設定の説明。
 導入の手順は [INSTALL.md](../INSTALL.md) にある。
 
 ## BonDriver (TVTest)
+
+BonDriver は個体を自分では開かず、DLL のフォルダーの `dt295.exe` (`dt295 serve`) に選局を頼んで TS を受け取る。
+
+- 応答する `dt295 serve` が無ければ、`OpenTuner` で BonDriver が起動する (ウィンドウは出ない)。
+  最後の TVTest を閉じると、`[Server] IdleExitSec` 秒 (既定 5) 後に `dt295 serve` も終了する。
+- 同じフォルダーの DLL (別の名前に複製したものも) は、どれも同じ `dt295 serve` を使う。
+  どの DLL が起動したかによらず、関係は変わらない。
+- `dt295 serve` は、DLL のフォルダーのファームウェアを使い、個体ごとの状態ファイル (`<シリアル番号>.state`) もそこに作る。
+  ログは DLL のフォルダーの `dt295-serve.log` (1 MiB を超えたら、次に起動するときに `.log.1` に移す)。
+- BonDriver と `dt295 serve` は `%TEMP%` のソケットでつながり、設定は要らない (下の "`dt295 serve`" セクション)
+- 別の TVTest が同じ個体で視聴しているときは、選局は失敗する (視聴中の TVTest からは奪わない)。
+  同じ TVTest のチャンネルの切り替えは、すぐに切り替わる。
+- ストリームが止まったとき (`dt295 serve` が終了した、個体が抜かれた、録画ソフトに個体を取られた) は、同じチャンネルを頼み直す (間隔は 2 秒から 30 秒まで延びる)。
+  個体を挿し直すと、TVTest を開いたままで映像が戻る。
+- C/N (`GetSignalLevel`) は、`dt295 serve` に 1 秒ごとに問い合わせた値
 
 ### チャンネルとサービス
 
@@ -18,29 +33,30 @@ BonDriver と ini、`dt295` の各コマンド、Linux のデーモンの設定�
   データのみのサービス (Gガイドなど) は TVTest の仕様で映らず、通常は登録もされない。
 - 未契約の有料サービスもスキャンには載るが、映像は出ない (ログに `no video / audio in the stream although the card works`)
 - 複数台のときは台数分 DLL と ini を複製し (`BonDriver_DT295-1.dll` など)、ini の `DeviceSerial` で個体を区別する。
-  ログと状態ファイルも DLL の名前で分かれる。
-- 同じ個体を別の名前の DLL でも使うときは、両方の ini の `StateFile` で同じファイルを指定 (下の "困ったとき" セクション)
+  ログは DLL の名前で、状態ファイルは個体で分かれる。
+- 同じ個体を別の名前の DLL (地デジ用と衛星用など) でも使える。
+  状態ファイルは個体ごとなので、指定は要らない。
+  同時に視聴できるのは、個体ごとに 1 つ。
 
 ### `BonDriver_DT295.ini`
 
 DLL と同じフォルダーに、同じ名前 (拡張子だけ `.ini`) で置く。
 無ければ既定値で動く。
 相対パスは DLL のフォルダーが基準。
+以前の版の `[Tuner] Firmware`, `TrcFirmware`, `StateFile`, `DeviceIndex` は読まない (残っていれば、その旨をログに出力)。
 文字コードは UTF-8 (BOM の有無は問わない) か BOM 付きの UTF-16LE で、どちらでもなければ Shift_JIS として読む (Windows ではシステムの ANSI コードページ。Linux の `dt295` も同じく Shift_JIS)。
 見本は `src/dt295-bondriver/BonDriver_DT295.ini`。
 
 | キー | 既定 | 内容 |
 |---|---|---|
-| `[Tuner] Firmware` | `mb86m01_assp_osec_idle.bin` | 起動用のファームウェア |
-| `[Tuner] TrcFirmware` | `mb86m01_assp_osec_trc_m_h.bin` | トランスコーダーのファームウェア。無いとストリームが始まらない |
-| `[Tuner] RawTS` | 0 | `1` で raw-TS モード (完全に自前コードのみ)。レジデント (チップに常駐させる第三者のコード) も補助コア (demod を動かす副 CPU) も純正ファームも使わず、ホストがチップを起こし、ホスト面の I2C で選局し、取り込みエンジンを設定して自前の pump で配信する。スクランブルされた TS をそのまま出し、B-CAS の解除は TVTest の CAS プラグイン (PC 側) に任せる。`0` (既定) は `Firmware`/`TrcFirmware` で動かし内蔵リーダーで解除する通常モード。最初の選局は cold (電源投入直後) の個体が必要 |
-| `[Tuner] DeviceIndex` | 0 | 複数台のときに使う個体の番号 (0 から)。開ける個体 (WinUSB で、ほかのプログラムが使っていない個体) のみを数えるので、片方が使用中だと番号がずれる |
-| `[Tuner] DeviceSerial` | なし | 使う個体の USB シリアル番号 (例 `CD23456789`。大文字小文字は区別しない)。`DeviceIndex` より優先し、つないだ順番に関係なくその個体を使用。`dt295 list` で確認可能 (1 台ずつ挿して確認し、本体にラベルを貼っておくとよい)。デバイス マネージャーの「デバイス インスタンス パス」 (`USB\VID_06B8&PID_103B\<シリアル番号>`) の末尾でも可 |
+| `[Tuner] RawTS` | 0 | `1` で raw-TS モード (完全に自前コードのみ)。レジデント (チップに常駐させる第三者のコード) も補助コア (demod を動かす副 CPU) も純正ファームも使わず、ホストがチップを起こし、ホスト面の I2C で選局し、取り込みエンジンを設定して自前の pump で配信する。スクランブルされた TS をそのまま出し、B-CAS の解除は TVTest の CAS プラグイン (PC 側) に任せる。`0` (既定) は DLL のフォルダーの純正ファームウェアで動かし、内蔵リーダーで解除する通常モード。最初の選局は cold (電源投入直後) の個体が必要。個体のモードは `dt295 serve` がその個体を開いたときの選局で決まり、開いている間は変わらない |
+| `[Tuner] DeviceSerial` | なし | 使う個体の USB シリアル番号 (例 `CD23456789`。大文字小文字は区別しない)。無ければ、つながっている 1 台を使う (複数台のときは必要)。`dt295 list` で確認可能 (1 台ずつ挿して確認し、本体にラベルを貼っておくとよい)。デバイス マネージャーの「デバイス インスタンス パス」 (`USB\VID_06B8&PID_103B\<シリアル番号>`) の末尾でも可 |
 | `[Tuner] UHF` / `CATV` | 1 / 1 | 地デジのチューニング空間 (UHF 13-62ch, CATV C13-C63) を表示するか |
 | `[Tuner] ChannelFile` | なし | ほかの BonDriver のチャンネル定義ファイル。指定すると、そのファイルのチューニング空間のみを、そのドライバーと同じ番号で表示 (`UHF` / `CATV` と `[BS]` / `[CS110]` は使わない)。下の "ほかの BonDriver のチャンネル定義" セクション |
-| `[Tuner] LogFile` | 0 | `1` で DLL と同じ名前の `.log` にログを出力。前回の分は `.log.1` に保存。ログは DebugView (`OutputDebugString`) にも常に出力 |
-| `[Tuner] LogLevel` | `info` | ログの詳しさ: `error`, `warn`, `info`, `debug`, `trace` (大文字小文字は区別しない)。ほかの値なら `info` とし、その旨をログに出力 |
-| `[Tuner] StateFile` | DLL と同じ名前の `.state` | 状態ファイル (デバイスのリンク鍵と衛星の PSI を保存)。空か行が無ければ DLL と同じ名前。無効化は不可 (無いと再オープンで復号できず、未契約のチャンネルがスキャンから漏れる)。消すと自動で再作成 |
+| `[Tuner] LogFile` | 0 | `1` で DLL と同じ名前の `.log` にログを出力。前回の分は `.log.1` に保存。ログは DebugView (`OutputDebugString`) にも常に出力。`dt295 serve` のログは、これによらず `dt295-serve.log` |
+| `[Tuner] LogLevel` | `info` | ログの詳しさ: `error`, `warn`, `info`, `debug`, `trace` (大文字小文字は区別しない)。ほかの値なら `info` とし、その旨をログに出力。`debug` と `trace` は、BonDriver が起動する `dt295 serve` にも渡す |
+| `[Server] IdleExitSec` | 5 | BonDriver が起動した `dt295 serve` が、クライアントがいなくなってから終了するまでの秒数。`0` で終了しない |
+| `[Server] StartTimeoutSec` | 5 | 起動した `dt295 serve` が応答するまで待つ秒数 (すぐに終了したときは待たない) |
 | `[BS]` / `[CS110]` | なし | `名前=周波数 (kHz),TSID[,ServiceID]` を 1 行に 1 チャンネル。周波数は IF (衛星の周波数 - 10678 MHz), TSID は放送の transport_stream_id (16 進は `0x` を付ける。7 以下なら TS 番号で、TSID の下位 3 ビットがその値の TS)。`ServiceID` を省くか -1 にすると、その TS の全サービス。1 行も無ければその空間は非表示 |
 
 組み込みの周波数 (ISDB-T の中心周波数 = 帯域の中心 + 1/7 MHz。純正の表と同じ):
@@ -56,7 +72,8 @@ UHF 51ch 以上 (700 MHz 以上。チューナーの設定がここで変わる)
 raw-TS モード (`RawTS=1`) は、スクランブルされたままの TS を TVTest に渡し、TVTest 側の CAS プラグインで B-CAS を解除する方式。
 ファームウェアは要らず、ホストがチップを cold から自力で立ち上げる (完全に自前コードのみ)。
 最初の選局だけ cold の個体が必要で、そのあと TVTest を閉じて開き直すだけなら差し直しは要らない。
-通常モード (System1, 内蔵リーダーで解除) と raw-TS モードは `RawTS` だけで切り替わる。
+通常モード (System1, 内蔵リーダーで解除) と raw-TS モードは `RawTS` で切り替わる。
+切り替えたら、TVTest をすべて閉じて `dt295 serve` が終了してから開き直す (raw-TS にするときは、個体の差し直しも要る)。
 内部の仕組みと機能差は [raw-ts.md](raw-ts.md)。
 
 ### ほかの BonDriver のチャンネル定義
@@ -83,15 +100,15 @@ raw-TS モード (`RawTS=1`) は、スクランブルされたままの TS を T
 
 | コマンド | 内容 |
 |---|---|
-| `dt295 list` | 接続中の個体の一覧 (DeviceIndex, シリアル番号, 使用中かどうか) |
+| `dt295 list` | 接続中の個体の一覧 (番号, シリアル番号, 使用中かどうか) |
 | `dt295 capture` | 個体を起動して選局し、TS をファイルか標準出力へ書き出し |
 | `dt295 state show` | 状態ファイルの内容の表示 |
 | `dt295 lineup` | 状態ファイルの SDT から ini の `[BS]` / `[CS110]` を再作成 |
 | `dt295 logo` | 局ロゴの受信 |
 | `dt295 mirakc-channels` | mirakc の設定のチャンネルの生成 |
 | `dt295 driver` | (Windows) ドライバーの確認と、WinUSB / 純正の切り替え |
-| `dt295 serve` | (Linux) 個体を開いたままにするデーモン |
-| `dt295 tune` | (Linux) デーモンに選局を頼み、TS を標準出力へ書き出し |
+| `dt295 serve` | 個体を開いたままにするデーモン (Windows では BonDriver が起動する) |
+| `dt295 tune` | デーモンに選局を頼み、TS を標準出力へ書き出し |
 | `dt295 etw-urbs` | 開発用: 純正ドライバーの USB ETW をアクセスの一覧に変換 ([development.md](development.md)) |
 
 オプションの一覧は `dt295 <コマンド> --help` で表示される。
@@ -103,8 +120,9 @@ raw-TS モード (`RawTS=1`) は、スクランブルされたままの TS を T
 - `-v` で DEBUG, `-vv` で TRACE のログを標準エラー出力に出力する。
   環境変数 `RUST_LOG` があればそちらが優先。
 - 失敗すると終了コード 1 (`dt295 lineup` のみ下のとおり)
-- Linux でデーモンを使わずに個体を開くには、udev のルールが必要 ([INSTALL.md](../INSTALL.md) の手順 4)。
-  デーモンが開いている個体は、デーモンを止めないと開けない。
+- Linux でデーモンを使わずに個体を開くには、udev のルールが必要 ([INSTALL.md](../INSTALL.md) の手順 4)
+- `dt295 serve` が開いている個体は開けない。
+  Windows では、TVTest がその個体を選局してから、最後の TVTest を閉じて数秒たつまで。
 
 ### `dt295 list`
 
@@ -113,8 +131,8 @@ index  serial        status  location
 0      CD23456789    free    \\?\usb#vid_06b8&pid_103b#cd23456789#{a5dcbf10-6530-11d2-901f-00c04fb951ed}
 ```
 
-使用中の個体は `busy` と表示され、index は付かない (`DeviceIndex` と `-i` は開ける個体だけを数える)。
-Windows では WinUSB になっていない個体も, Linux ではデーモンが開いている個体も `busy`。
+使用中の個体は `busy` と表示され、index は付かない (`-i` は開ける個体だけを数える)。
+`dt295 serve` が開いている個体と、WinUSB になっていない個体 (Windows) も `busy`。
 
 ### `dt295 capture`
 
@@ -133,7 +151,8 @@ dt295 capture --raw-ts --serial CD23456789 --channel 27ch -t 60 -o raw.ts
   SIGKILL で強制終了されても、個体に残ったストリームは次の起動時に停止される。
 - `-o` を省くと標準出力へ書き出し (端末には出力しない)
 - 出力先 (ファイルや読み手のパイプ) が数秒以上止まると、その間の TS は捨て、終了時に `bytes dropped` として表示する (止まった出力をストリームが待つと、どちらのモードでも TS が途切れるため)
-- `--bondriver <ini>` は BonDriver の ini からファームウェア, 個体, 状態ファイルを読み取り、コマンドラインでの指定が優先される。
+- `--bondriver <ini>` は BonDriver の ini の個体 (`DeviceSerial`) と `RawTS` を使い、ファームウェアと状態ファイル (`<シリアル番号>.state`) は ini のフォルダーのものを使う (BonDriver が起動する `dt295 serve` と同じ)。
+  コマンドラインでの指定が優先される。
   Linux でも同じ形式の ini を設定ファイルとして使える。
 - `--raw-ts` は raw-TS モードで取り込む。
   純正ファームウェアも状態ファイルも使わず (`--fw`, `--trc`, `--state`, `--sid` は指定するとエラー)、スクランブルされた TS の全サービスをそのまま出力するので、B-CAS の解除は受け取る側で行う。
@@ -144,7 +163,7 @@ dt295 capture --raw-ts --serial CD23456789 --channel 27ch -t 60 -o raw.ts
   大文字小文字は区別しない。
   `ChannelFile` の選局できないチャンネル (DVB-S や左旋など) の名前は、理由を表示してエラー。
 - `--state <ファイル>` は、その状態ファイルのリンク鍵を使い、検証できた鍵を書き戻す。
-  TVTest と交互に使うときは、BonDriver の `.state` を渡す (下の "困ったとき" セクション)。
+  TVTest と交互に使うときは、`--bondriver` で BonDriver の ini を渡せば、同じ状態ファイルを使う (下の "困ったとき" セクション)。
 - Linux でデーモンの個体を使うときは、デーモンを止めてから `-c /etc/dt295.conf` を指定 (リンク鍵が引き継がれる)
 - 録画ソフトのチューナーのコマンドにもできるが、起動のたびに個体を初期化するので遅い。
   Linux では `dt295 serve` と `dt295 tune` を使う。
@@ -152,18 +171,19 @@ dt295 capture --raw-ts --serial CD23456789 --channel 27ch -t 60 -o raw.ts
 ### `dt295 state show`
 
 ```
-dt295 state show BonDriver_DT295.state
+dt295 state show CD23456789.state
 ```
 
 状態ファイルのリンク鍵と、衛星の PSI セクションをテーブルと TS の組ごとに表示する。
-`dt295 serve` の状態ファイル (`/var/lib/dt295/<シリアル番号>.state`) も読める。
+状態ファイルは `dt295 serve` が個体ごとに作る `<シリアル番号>.state` (Windows では BonDriver のフォルダー、Linux では `/var/lib/dt295`)。
+以前の版の BonDriver の状態ファイル (`BonDriver_DT295.state`) も読める。
 
 ### `dt295 lineup`
 
 ```
-dt295 lineup BonDriver_DT295.state                                          # [BS] / [CS110] の行を出力する
-dt295 lineup BonDriver_DT295.state --bondriver BonDriver_DT295.ini          # ini との差分を表示する
-dt295 lineup BonDriver_DT295.state --bondriver BonDriver_DT295.ini --write  # ini を書き換える (.bak を残す)
+dt295 lineup CD23456789.state                                          # [BS] / [CS110] の行を出力する
+dt295 lineup CD23456789.state --bondriver BonDriver_DT295.ini          # ini との差分を表示する
+dt295 lineup CD23456789.state --bondriver BonDriver_DT295.ini --write  # ini を書き換える (.bak を残す)
 ```
 
 - 状態ファイルに溜まった SDT から、TV, 音声のみ, データ放送のサービスのある TS を 1 TS 1 行で出力する。
@@ -212,11 +232,10 @@ dt295 logo --unschedule                                 # 毎日の実行を解�
 空いている個体で 929 を選局し、ロゴがそろったら個体を解放して、TVTest のロゴファイル (`LogoData`, `LogoData.ini`, `Logo` フォルダー) に追加する。
 書き換える前の `LogoData` と `LogoData.ini` は `.bak` に残る。
 
-- 個体, ファームウェア, 状態ファイルは、TVTest の BonDriver のフォルダーにある `BonDriver_DT295*.ini` から読み取る。
-  視聴中の個体は使わない。
+- 個体と `RawTS` は、TVTest の BonDriver のフォルダーにある `BonDriver_DT295*.ini` から読み取り、ファームウェアと状態ファイルはそのフォルダーのものを使う。
+  TVTest が使っている個体 (`dt295 serve` が開いている個体) は使わない。
   `RawTS=1` の ini の個体は、BonDriver と同じく純正ファームウェアを使わずに raw-TS で受信する (状態ファイルも使わないので、そのまま raw-TS の TVTest で使える)。
-  `TrcFirmware=` が空の ini (raw-TS でないもの) の個体はストリームを始められないので、エラーで終了する。
-  `DeviceSerial` の個体が空いていなければ、ほかの空いている個体を状態ファイル無しで使う (直前に別のソフトが使っていた個体だと復号できないことがある)。
+  `DeviceSerial` の個体が空いていなければ、ほかの空いている個体を使う。
   `--serial <シリアル番号>` でその個体のみを使う。
 - 待つのは最長 `--wait <分>` (既定 45) で、空いた個体が無ければ空くのを待ち、受信に失敗したら再試行
 - 新しいロゴは、TVTest の次回の起動から表示される。
@@ -309,13 +328,14 @@ channels:                       # ここから下が dt295 mirakc-channels の�
   mirakc の番組表の取得は、録画にチューナーを取られるとその回を打ち切り、次は 12 時間後になる。
   どちらも 2 台あれば起きない。
 
-### `dt295 serve` (Linux)
+### `dt295 serve`
 
-`/etc/dt295.conf` の個体を開いたまま保持し、`dt295 tune` からの要求で選局して TS を送信するデーモン。
-録画ソフトが `dt295 tune` を止めても、個体の後始末はデーモンが行う。
-systemd のユニットは [INSTALL.md](../INSTALL.md) の手順 5。
+個体を開いたまま保持し、`dt295 tune` と BonDriver からの要求で選局して TS を送信するデーモン。
+録画ソフトが `dt295 tune` を止めても、TVTest を閉じても、個体の後始末はデーモンが行う。
+Windows では BonDriver が DLL のフォルダーの `dt295.exe` を起動するので (上の "BonDriver (TVTest)" セクション)、手で起動する必要はない。
+Linux の systemd のユニットは [INSTALL.md](../INSTALL.md) の手順 5。
 
-`/etc/dt295.conf`:
+設定ファイル (Linux では `/etc/dt295.conf`):
 
 ```ini
 [dt295]
@@ -324,6 +344,7 @@ firmware-dir = /usr/lib/firmware/dt295
 ; 個体ごとの状態ファイル (<シリアル番号>.state)
 state-dir = /var/lib/dt295
 ; dt295 serve が待ち受け、dt295 tune が接続するソケット
+; (TCP にするときは代わりに listen = 127.0.0.1:41200 など)
 socket = /run/dt295/dt295.sock
 
 ; 使う個体ごとに 1 つ (シリアル番号は dt295 list で分かる)
@@ -334,18 +355,41 @@ socket = /run/dt295/dt295.sock
 raw-ts = true
 ```
 
-- `[dt295]` の 3 つは省略できる (上の値が既定)。
+- どれも省略できる (`[dt295]` は上の値が既定)。
+  Linux では `/etc/dt295.conf` が無ければ、すべて既定で動く。
   未知のセクションやキーはエラーになる。
+- `[unit ...]` を書くと、デーモンはその個体を起動時に開き、その個体のみを扱う。
+  書かなければ、要求の個体 (指定が無ければ、つながっている 1 台) を最初の要求で開き、つながっている個体はどれも扱う。
 - `[unit ...]` の `raw-ts` は既定 `false` (System1, 内蔵カードで解除)。
-  `true` にするとその個体は純正ファーム無しでスクランブルされたままの TS を出し、解除はホスト側に任せる (下の "raw-TS モード")
+  `true` にするとその個体は純正ファーム無しでスクランブルされたままの TS を出し、解除はホスト側に任せる (下の "raw-TS モード")。
+  `[unit ...]` の無い個体は、開いたときの要求 (BonDriver の `RawTS`) のモードで動き、開いている間は別のモードの要求を断る。
 - コメント (`;` か `#`) は行頭に書く。
   値の後ろに書くと値の一部になる。
 - `dt295 serve -c <ファイル>` で別の設定ファイルを読み込み
-- ソケットは dt295 グループが読み書きできるので (0660)、録画ソフトのユーザーを dt295 グループに追加
+- `--firmware-dir` と `--state-dir` は、設定ファイルの `firmware-dir` と `state-dir` より優先される
+- `--idle-exit <秒>` を付けると、クライアントがその秒数いなければ終了する (BonDriver が起動するとき)。
+  選局中とストリーム中は、クライアントがいるものとして数える。
+- `listen` に `ホスト:ポート` を書くと、ソケットの代わりに TCP で待ち受ける (`socket` とどちらか一方)
+- 待ち受ける場所は、コマンドラインの `--socket` / `--listen`、環境変数の `DT295_SOCKET` / `DT295_LISTEN`、設定ファイルの `socket` / `listen`、既定の順で決まる
+- 前の `dt295 serve` が残したソケットのファイルは置き換える。
+  そのソケットで別の `dt295 serve` が応答するときと、ソケットでないファイルがあるときは、消さずにエラーで終了する。
+  ソケットの横に `<ソケット>.lock` を作る (ソケットを置き換えるときと消すときの排他に使い、消さない)。
+  ロックできなければ、警告を出してロックせずに続ける。
+- ソケットは dt295 グループが読み書きできるので (0660、Linux)、録画ソフトのユーザーを dt295 グループに追加
 - ログは journald (`journalctl -u dt295`)
 - 個体が抜かれたら閉じて、挿し直されたら再オープンする。
   ファームウェアが止まっていたら、選局の前に再初期化する。
   ストリーム中に止まったら、起動し直して同じクライアントに送り続ける (3 秒ほど途切れる)。
+
+Windows では次の点が異なる:
+
+- 設定ファイルは、`-c` で指定したときのみ読む
+- `socket` の既定は `%TEMP%\dt295-<ハッシュ>.sock` で、ハッシュは `dt295.exe` のフォルダーのパスから求める。
+  同じフォルダーの `dt295 tune` と BonDriver は、指定しなくても同じソケットにつながる。
+- AF_UNIX を使えない環境 (Windows 10 1803 より前、`%TEMP%` のパスがソケットのアドレスに収まらない) では、既定はループバックの TCP で、ポートは `41200`-`41299` のうちフォルダーで決まる
+- `firmware-dir` と `state-dir` は、既定で `dt295.exe` のフォルダー (設定ファイルを指定したときは、そのフォルダー)。
+  設定ファイルの相対パス (`socket` も) は、設定ファイルのフォルダーが基準。
+- ログは標準エラー出力 (BonDriver が起動したときは `dt295-serve.log`)
 
 #### raw-TS モード (完全に自前コードのみ)
 
@@ -373,7 +417,7 @@ B-CAS の解除は、録画ソフトのパイプラインに置いた外部ツ�
   libarib25 の `b25` は `-` (標準入出力の意味) を受け付けないので、`/dev/stdin /dev/stdout` を渡す。
   解除には pcscd (pcsc-lite) とリーダーのカードが要る
 
-### `dt295 tune` (Linux)
+### `dt295 tune`
 
 ```
 dt295 tune --serial AB12345678 --ter 557142857 > ter.ts             # 地デジ (周波数は Hz)、TS の全サービス
@@ -382,6 +426,7 @@ dt295 tune --serial AB12345678 --ter 557142857 --sid 1024 > nhk.ts  # 1 サー�
 ```
 
 - `--tsid` と `--sid` の省略は `dt295 capture` と同じ
+- `--serial` を省くと、デーモンが扱う 1 台 (設定ファイルの 1 台か、つながっている 1 台)
 - 止めるまで TS を出力し続ける。
   どの止め方でも、デーモンがストリームを止める。
 - 選局できなかったときは理由を表示して終了コード 1
@@ -390,8 +435,8 @@ dt295 tune --serial AB12345678 --ter 557142857 --sid 1024 > nhk.ts  # 1 サー�
   ロゴの受信やチャンネルスキャンなど、録画を止めてはいけない用途に使う。
   `--if-free` の要求と通常の要求が同時に来たときは、通常の要求が優先される。
   `--if-free` のストリームの開始中 (2-3 秒) に来た要求は、開始が完了してから切り替えるので、その分だけ待たされる。
-- 接続するソケットは `/etc/dt295.conf` の `socket`。
-  `-c <ファイル>` で別の設定、`--socket <パス>` で直接指定できる (`mirakc-channels --scan` も同じ)。
+- 接続先は `dt295 serve` と同じく、コマンドラインの `--socket` / `--connect`、環境変数の `DT295_SOCKET` / `DT295_LISTEN`、設定ファイル (`-c <ファイル>`、Linux では既定で `/etc/dt295.conf`) の `socket` / `listen`、既定の順で決まる (`mirakc-channels --scan` も同じ)。
+  Windows の既定は `dt295.exe` のフォルダーのソケットなので、BonDriver のフォルダーの `dt295.exe` なら TVTest と同じ `dt295 serve` につながる。
 
 ## `bontest` (BonDriver の動作確認)
 
@@ -410,34 +455,39 @@ bontest C:\TVTest\BonDriver\BonDriver_DT295.dll 0 14 8 [out.ts]
 # <空間>[:<最初>[-<最後>]] を並べる。例: CS110 の 1 つ目、BS の 1 つ目、UHF 全部
 bontest C:\TVTest\BonDriver\BonDriver_DT295.dll scan 3:0 2:0 0
 
-# チャンネルを選ばずに 60 秒開いたままにする (その間の keepalive や抜き差しの扱いはログで確認)
+# チャンネルを選ばずに 60 秒開いたままにする (その間 dt295 serve が動き続け、閉じてから終わることを確認)
 bontest C:\TVTest\BonDriver\BonDriver_DT295.dll idle 60
 
 # 27ch を 10 秒受信して閉じ、90 秒後に DLL を読み込んだまま同じことをもう一度 (DLL を読み込んだままにするソフトの動き)
 bontest C:\TVTest\BonDriver\BonDriver_DT295.dll reopen 0 14 10 90
 ```
 
-DLL の ini、状態ファイル、ログがそのまま使われる。
+DLL の ini とログ、DLL のフォルダーの `dt295.exe` (`dt295 serve`) と状態ファイルがそのまま使われる。
 
 ## 困ったとき
 
 - 使っているバージョンの確認: `dt295 --version`, DLL はプロパティの詳細タブの製品バージョンか, ログの先頭の `version` の行
-- TS が出ない、スキャンで何も見つからない: カードが挿さっているか、`TrcFirmware` のファイルがあるかを確認する。
-  ログ (`LogFile=1`) の `SetChannel ... LOCK / nolock` と `s1 worker: delivered ...` を確認する。
-- ログに `firmware stopped acking commands` や `the firmware faulted`: ファームウェアが応答しなくなった。
-  ドライバーが再初期化して選局をやり直す (`re-init succeeded`)。
-  ストリーム中なら、起動し直してストリームを始め直す (ログに `the firmware stopped acking: starting the stream over`。3 秒ほど途切れる)。
-  `re-init FAILED` のときは USB を抜き挿しする。
+- TVTest で BonDriver を開けない: DLL のフォルダーに `dt295.exe` があるかを確認する。
+  `dt295 serve` がすぐに終了したときは、`dt295-serve.log` に理由が出る。
+- 選局が失敗し、BonDriver のログに `busy`: 別の TVTest がその個体で視聴している。
+  `is not connected` や `no PIX-DT295 is connected`: 個体がつながっていない (挿せば、TVTest を開いたままで映像が出る)。
+  `streams raw-ts ... not system1` (またはその逆): `RawTS` の違う TVTest が個体を開いている。
+- TS が出ない、スキャンで何も見つからない: カードが挿さっているか、DLL のフォルダーに 2 つのファームウェアがあるかを確認する。
+  BonDriver のログ (`LogFile=1`) の `SetChannel` の行と、`dt295-serve.log` の `streaming` と `stream ended` の行を確認する。
+- `dt295-serve.log` に `the firmware faulted` や `booting the device again`: ファームウェアが応答しなくなった。
+  `dt295 serve` が起動し直して選局をやり直す。
+  ストリーム中なら、起動し直してストリームを始め直す (ログに `starting the stream over`。3 秒ほど途切れる)。
+  `cannot boot the unit` が続くときは USB を抜き挿しする。
 - 映像も音も出ない (字幕のみ。TVTest のスクランブルの数は 0): B-CAS カードが正常に認識されていない。
-  カードを抜き挿ししたときは、挿してから 6 秒ほどで自動で復帰する (ログに `a B-CAS card was put in: starting the stream over`)。
-  ログに `b-cas: card state 5 into the stream` が出るときは、カードの接触不良なので挿し直す。
+  カードを抜き挿ししたときは、挿してから 6 秒ほどで自動で復帰する (`dt295-serve.log` に `a B-CAS card was put in: starting the stream over`)。
+  `dt295-serve.log` に `b-cas: card state 5 into the stream` が出るときは、カードの接触不良なので挿し直す。
 - 長時間使った後に TS が欠ける、または出ない: USB を抜き挿しすると復旧する。
   TVTest は開いたままでよい (挿し直すと自動で再オープンし、同じチャンネルを再選局する)。
 - raw-TS モードで、ログに `no pump for ... ms` や `continuity gaps` の WARN が出る (Linux): 非力な機器で pump が間に合わず、TS が欠けている。
   `systemctl edit dt295` で `[Service]` に `LimitRTPRIO=1` と `LimitNICE=-10` を追加し、デーモンを再起動する。
   優先度が上がったかは、ログの `raw-TS cold: stream thread at ...` の行で確認できる。
-- 同じ個体を別の名前の DLL や `dt295 capture` と交互に使うと復号できない (ログに `no decodable PAT -- the link key does not match`): デバイスは、前のプロセスの終了から 1 分ほどでセキュアセッションが切れるまで、最初に渡されたリンク鍵で暗号化し続ける。
-  鍵は状態ファイルに残るので、別の名前の DLL どうしは `StateFile` で同じファイルを指定し、`dt295 capture` には `--state` で TVTest の状態ファイルを渡す。
+- 同じ個体を TVTest と `dt295 capture` で交互に使うと復号できない (ログに `no decodable PAT -- the link key does not match`): デバイスは、前のプロセスの終了から 1 分ほどでセキュアセッションが切れるまで、最初に渡されたリンク鍵で暗号化し続ける。
+  鍵は状態ファイルに残るので、`dt295 capture` には `--bondriver` で BonDriver の ini を渡す (`dt295 serve` と同じ状態ファイルを使う)。
   抜き挿しでも直る。
 - 夜中のスキャンで一部の局が見つからない: 放送休止中の局はロックしない。
   日中にもう一度スキャンする。

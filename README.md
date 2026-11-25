@@ -4,7 +4,8 @@ PIXELA PIX-DT295 を純正ドライバーの代わりに動かす、ユーザー
 
 ## できること
 
-- Windows: TVTest 用の BonDriver `BonDriver_DT295.dll` (x64 / x86) で、地デジ, BS, 110度CS の視聴とチャンネルスキャン
+- Windows: TVTest 用の BonDriver `BonDriver_DT295.dll` (x64 / x86) で、地デジ, BS, 110度CS の視聴とチャンネルスキャン。
+  個体は、BonDriver が起動するデーモン `dt295 serve` が扱う。
 - Linux: 個体を開いたままにするデーモン `dt295 serve` と、録画ソフトがチューナーのコマンドとして呼ぶ `dt295 tune`
   - TS のキャプチャ
   - 接続中の PIX-DT295 の一覧, BS / CS のチャンネル定義の作り直し

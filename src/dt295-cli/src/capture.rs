@@ -209,6 +209,7 @@ fn conf_device_args(conf: &Conf, given: &DeviceArgs) -> Result<(DeviceArgs, bool
             .state
             .clone()
             .or_else(|| Some(conf.state_file(&serial))),
+        state_dir: None,
         serial: Some(serial),
     };
     Ok((dev, raw))
@@ -645,10 +646,8 @@ mod tests {
             dev.fw.as_deref(),
             Some(Path::new("/fw/mb86m01_assp_osec_idle.bin"))
         );
-        assert_eq!(
-            dev.state.as_deref(),
-            Some(Path::new("/var/lib/dt295/AB12345678.state"))
-        );
+        // the default state folder: /var/lib/dt295 (on Windows the configuration's)
+        assert_eq!(dev.state, Some(one.state_file("AB12345678")));
         let two = Conf::parse("[unit A]\n[unit B]\n").unwrap();
         assert!(conf_device_args(&two, &a.dev).is_err(), "which one?");
         let a = args(&["-c", "x.conf", "--serial", "B", "--ter", "557142857"]);

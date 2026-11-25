@@ -444,7 +444,7 @@ fn cold_arm(
     full: bool,
     saved: &mut Saved,
     log: &mut Vec<String>,
-) -> Result<bool> {
+) -> Result<Status> {
     use crate::frmon_host;
 
     // Gate first (full path only), read-only, BEFORE any board write: a chip that is not
@@ -473,7 +473,7 @@ fn cold_arm(
     } else {
         setup(io)?; // the host-face I2C controller (idempotent; cheap on a retune)
     }
-    let locked = {
+    let status = {
         let mut bus = FjBus::new(io);
         let sys = if terrestrial {
             // The same captured sequence as the System1 path. The T demod's 0x47 / 0x4F / 0x72
@@ -492,13 +492,13 @@ fn cold_arm(
             st.cn_mdb / 1000,
             (st.cn_mdb % 1000).abs()
         ));
-        st.locked
+        st
     };
     // After the lock: arm the capture engine, then start it.
     host_configure_capture(io, log)?;
     host_start_capture(io)?;
     log.push("capture started (0x1902010 = 0x02000000, host window)".into());
-    Ok(locked)
+    Ok(status)
 }
 
 /// Best TS sync over the two record sizes we might see: 188 (bare TS) and 192 (our ring
@@ -552,7 +552,7 @@ pub fn cold_capture(
     let mut log = Vec::new();
     let mut saved: Saved = Vec::new();
     let result = (|| -> Result<bool> {
-        let locked = cold_arm(io, terrestrial, freq_hz, tsid, true, &mut saved, &mut log)?;
+        let locked = cold_arm(io, terrestrial, freq_hz, tsid, true, &mut saved, &mut log)?.locked;
         let rp0 = win_read32(io, CAP_RING_WRITE)?;
         std::thread::sleep(std::time::Duration::from_millis(300));
         let rp1 = win_read32(io, CAP_RING_WRITE)?;
@@ -659,15 +659,15 @@ pub fn cold_stream(
 /// `full` does the one-time bring-up (the first tune after a cold open); a channel change
 /// passes `full` = false and only retunes + rearms. After this returns, the capture engine
 /// streams into the ring and the monitor's TS pump is uploaded; the caller loops
-/// [`crate::frmon_host::MonitorResident::pump`] + EP 0x81 reads. Returns whether the demod
-/// locked. No resident, no aux core, no vendor firmware.
+/// [`crate::frmon_host::MonitorResident::pump`] + EP 0x81 reads. Returns the demod's status
+/// after the tune (the lock, the C/N). No resident, no aux core, no vendor firmware.
 pub fn cold_prepare_stream(
     io: &Io,
     terrestrial: bool,
     freq_hz: u32,
     tsid: Option<u16>,
     full: bool,
-) -> Result<bool> {
+) -> Result<Status> {
     let mut log = Vec::new();
     let mut saved: Saved = Vec::new();
     let armed = cold_arm(io, terrestrial, freq_hz, tsid, full, &mut saved, &mut log);
@@ -680,9 +680,9 @@ pub fn cold_prepare_stream(
     // access (e.g. the boot-state register 0x82008, the System1 start's reads). cold_capture /
     // cold_stream restore it the same way on every path.
     restore_windows(io);
-    let locked = armed?;
+    let status = armed?;
     crate::frmon_host::upload_ts_pump(io)?;
-    Ok(locked)
+    Ok(status)
 }
 
 /// Read the demod's C/N (0.001 dB) over the host face, for a live level during cold

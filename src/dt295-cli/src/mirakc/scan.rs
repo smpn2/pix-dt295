@@ -14,18 +14,18 @@
 //! once they air). With `--on-air` each is tuned, as a TVTest scan does, and kept only
 //! if its PAT comes (dt295 sends nothing until a PAT lists the service).
 
-// the scan itself needs the daemon's Unix socket; the rest is tested everywhere
+// the scan itself is for Linux; the rest is tested everywhere
 #![cfg_attr(not(unix), allow(dead_code))]
 
 use std::collections::{BTreeMap, HashSet};
-#[cfg(unix)]
-use std::path::Path;
 #[cfg(unix)]
 use std::time::{Duration, Instant};
 
 #[cfg(unix)]
 use anyhow::{Context, Result, bail};
 use dt295::chan::{self, transponder};
+#[cfg(unix)]
+use dt295::ipc::{self, Target};
 
 use super::Channel;
 use super::psi::{Psi, Table};
@@ -188,7 +188,7 @@ pub(super) fn run(
     serial: &str,
     catv: bool,
     on_air: bool,
-    socket: &Path,
+    target: &Target,
 ) -> Result<(Vec<Channel>, Vec<String>)> {
     let mut found = Vec::new();
     let mut skipped = Vec::new();
@@ -196,7 +196,7 @@ pub(super) fn run(
     for (label, channel, hz) in terrestrial_channels(catv) {
         let tuning = Tuning::Terrestrial { hz };
         let done = |psi: &Psi, _: Duration| psi.sdt_actual_complete() && psi.pat.is_some();
-        match tune(socket, serial, tuning, None, TERRESTRIAL_READ, done)? {
+        match tune(target, serial, tuning, None, TERRESTRIAL_READ, done)? {
             Tuned::Refused(why) if why.starts_with("no lock") => {}
             Tuned::Refused(why) => skipped.push(format!("{label}: {why}")),
             Tuned::Stream(psi) => match terrestrial(&label, &channel, hz, &psi) {
@@ -222,7 +222,7 @@ pub(super) fn run(
         let mut tables = Vec::new();
         let tuning = Tuning::Satellite { hz, tsid };
         let whole = |_: &Psi, t: Duration| t >= SDT_READ;
-        let Tuned::Stream(psi) = tune(socket, serial, tuning, None, SDT_READ, whole)? else {
+        let Tuned::Stream(psi) = tune(target, serial, tuning, None, SDT_READ, whole)? else {
             skipped.push(format!("{label}: TS 0x{tsid:04X} does not lock"));
             continue;
         };
@@ -230,7 +230,7 @@ pub(super) fn run(
         if let Some(other) = second_ts(onid, tsid, &tables) {
             let hz = transponder(onid, other).map_or_default(|t| t.if_khz * 1000);
             let tuning = Tuning::Satellite { hz, tsid: other };
-            if let Tuned::Stream(psi) = tune(socket, serial, tuning, None, SDT_READ, whole)? {
+            if let Tuned::Stream(psi) = tune(target, serial, tuning, None, SDT_READ, whole)? {
                 tables.extend(psi.tables());
             }
         }
@@ -244,7 +244,7 @@ pub(super) fn run(
                 let hz = transponder(onid, tsid).map_or_default(|t| t.if_khz * 1000);
                 let tuning = Tuning::Satellite { hz, tsid };
                 let streams = |psi: &Psi, _: Duration| psi.pat.is_some();
-                match tune(socket, serial, tuning, Some(sid), SERVICE_READ, streams)? {
+                match tune(target, serial, tuning, Some(sid), SERVICE_READ, streams)? {
                     Tuned::Stream(psi) if psi.pat.is_some() => {}
                     Tuned::Stream(_) => {
                         skipped.push(format!("{}: off the air", ch.name));
@@ -280,7 +280,7 @@ enum Tuned {
 /// `limit` passes or the stream ends (another client took the unit, or it went away).
 #[cfg(unix)]
 fn tune(
-    socket: &Path,
+    target: &Target,
     serial: &str,
     tuning: Tuning,
     sid: Option<u16>,
@@ -288,20 +288,17 @@ fn tune(
     enough: impl Fn(&Psi, Duration) -> bool,
 ) -> Result<Tuned> {
     use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
-    use std::os::unix::net::UnixStream;
 
     let req = Request {
         unit: serial.to_owned(),
         tuning,
         sid,
+        mode: None,
+        client: None,
         if_free: true,
     };
-    let conn = UnixStream::connect(socket).with_context(|| {
-        format!(
-            "cannot connect to dt295 serve at {} (is it running?)",
-            socket.display()
-        )
-    })?;
+    let conn = ipc::connect(target)
+        .with_context(|| format!("cannot connect to dt295 serve at {target} (is it running?)"))?;
     conn.set_read_timeout(Some(REPLY_WAIT))?;
     (&conn)
         .write_all(format!("{}\n", req.to_line()).as_bytes())
@@ -312,7 +309,7 @@ fn tune(
         .context("no reply from dt295 serve")?;
     match Reply::parse(&line) {
         _ if line.is_empty() => bail!("dt295 serve closed the connection"),
-        Reply::Ok => {}
+        Reply::Ok { .. } => {}
         Reply::Busy(why) => bail!("{why}: scan when nothing records"),
         Reply::Error(why) => return Ok(Tuned::Refused(why)),
     }

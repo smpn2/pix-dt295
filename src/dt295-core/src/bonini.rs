@@ -1,15 +1,19 @@
 //! The `[Tuner]` section of a `BonDriver_DT295.ini` as the BonDriver reads it, shared
-//! with the `dt295` command, which takes the same file as its configuration: the
-//! firmware, the unit, the state file, the raw-TS switch and the channel file of another
-//! BonDriver. Relative paths are under the ini's folder. The tuning spaces of the file are
+//! with the `dt295` command, which takes the same file as its configuration: the unit,
+//! the raw-TS switch and the channel file of another BonDriver. The unit's firmware and
+//! state file are in the ini's folder, where the `dt295 serve` the BonDriver starts keeps
+//! them. Relative paths are under the ini's folder. The tuning spaces of the file are
 //! [`chan::ini_spaces`](crate::chan::ini_spaces).
 
-use std::ffi::OsString;
 use std::fmt;
 use std::path::{self, Path, PathBuf};
 
 use crate::fwdl::{IDLE_FIRMWARE, TRC_FIRMWARE};
 use crate::profile::{self, Ini};
+
+/// `[Tuner]` keys of earlier versions, no longer read: the firmware and the state file
+/// are those of the ini's folder, and `dt295 serve` knows its units by serial number.
+pub const RETIRED_KEYS: [&str; 4] = ["Firmware", "TrcFirmware", "DeviceIndex", "StateFile"];
 
 /// Which device to open.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -34,17 +38,11 @@ impl fmt::Display for DeviceSel {
 /// What `[Tuner]` says about the unit and its files.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Tuner {
-    /// `Firmware`, the idle firmware: absent = the vendor's name. An empty value is the
-    /// folder itself (Win32: present but empty), which does not boot.
-    pub firmware: PathBuf,
-    /// `TrcFirmware`, the System1 transcoder firmware: absent = the vendor's name; empty
-    /// = `None`, no stream can start (there is no System2 path).
-    pub trc_firmware: Option<PathBuf>,
-    /// `DeviceSerial` (blanks trimmed, upper case), else `DeviceIndex`
-    /// (`GetPrivateProfileInt`, absent = 0; a negative one opens nothing).
-    pub device: DeviceSel,
-    /// `StateFile`: absent or empty = the ini's name with `.state`, else that file.
-    pub state_file: PathBuf,
+    /// The ini's folder (empty = the working directory): the unit's firmware and its
+    /// state file are there.
+    pub dir: PathBuf,
+    /// `DeviceSerial` (blanks trimmed, upper case); `None` = the only unit connected.
+    pub serial: Option<String>,
     /// `RawTS`: non-zero = the blob-free raw-TS path (absent = the System1 path).
     pub raw_ts: bool,
     /// `ChannelFile`: the channel file of another BonDriver whose tuning spaces to list
@@ -53,48 +51,46 @@ pub struct Tuner {
 }
 
 impl Tuner {
-    /// `[Tuner]` of `ini`, the file `stem` + `.ini` in the folder `dir` (the base of
-    /// relative paths; empty = the working directory). The default state file is `stem`
-    /// + `.state`.
-    pub fn from_ini(ini: &Ini, dir: &Path, stem: &Path) -> Self {
+    /// `[Tuner]` of `ini`, a file in the folder `dir` (the base of relative paths; empty
+    /// = the working directory).
+    pub fn from_ini(ini: &Ini, dir: &Path) -> Self {
         let string = |key: &str| profile::get(ini, "Tuner", key);
-        let int = |key: &str, default| profile::get_int(ini, "Tuner", key, default);
-
-        let firmware = resolve(dir, string("Firmware").unwrap_or(IDLE_FIRMWARE));
-        let trc = string("TrcFirmware").unwrap_or(TRC_FIRMWARE);
-        let trc_firmware = (!trc.is_empty()).then(|| resolve(dir, trc));
-
-        let index = int("DeviceIndex", 0) as i32; // truncated to 32 bits
         let serial = string("DeviceSerial").unwrap_or("").trim();
-        let device = if serial.is_empty() {
-            DeviceSel::Index(usize::try_from(index).unwrap_or(usize::MAX))
-        } else {
-            DeviceSel::Serial(serial.to_ascii_uppercase())
-        };
-
-        // The state file cannot be turned off (no switch-off value).
-        let state_file = match string("StateFile").unwrap_or("") {
-            "" => {
-                let mut s = OsString::from(stem);
-                s.push(".state");
-                PathBuf::from(s)
-            }
-            p => resolve(dir, p),
-        };
-        let raw_ts = int("RawTS", 0) != 0;
         let channel_file = match string("ChannelFile").unwrap_or("").trim() {
             "" => None,
             p => Some(resolve(dir, p)),
         };
         Self {
-            firmware,
-            trc_firmware,
-            device,
-            state_file,
-            raw_ts,
+            dir: dir.to_owned(),
+            serial: (!serial.is_empty()).then(|| serial.to_ascii_uppercase()),
+            raw_ts: profile::get_int(ini, "Tuner", "RawTS", 0) != 0,
             channel_file,
         }
     }
+
+    /// The idle firmware, in the ini's folder.
+    pub fn firmware(&self) -> PathBuf {
+        resolve(&self.dir, IDLE_FIRMWARE)
+    }
+
+    /// The System1 transcoder firmware, in the ini's folder.
+    pub fn trc_firmware(&self) -> PathBuf {
+        resolve(&self.dir, TRC_FIRMWARE)
+    }
+
+    /// The state file of the unit `serial` (link key, PSI): `<serial>.state` in the
+    /// ini's folder, as `dt295 serve` names it.
+    pub fn state_file(&self, serial: &str) -> PathBuf {
+        resolve(&self.dir, &format!("{}.state", serial.to_ascii_uppercase()))
+    }
+}
+
+/// The [`RETIRED_KEYS`] an ini still has.
+pub fn retired_keys(ini: &Ini) -> Vec<&'static str> {
+    RETIRED_KEYS
+        .into_iter()
+        .filter(|k| profile::get(ini, "Tuner", k).is_some())
+        .collect()
 }
 
 /// An ini path: absolute (`X:...`, `\\...`, or absolute on this OS) as is, else
@@ -131,20 +127,19 @@ mod tests {
     }
 
     fn tuner(text: &str) -> Tuner {
-        let stem = dir().join("BonDriver_DT295");
-        Tuner::from_ini(&profile::parse(text).expect("parses"), &dir(), &stem)
+        Tuner::from_ini(&profile::parse(text).expect("parses"), &dir())
     }
 
     #[test]
     fn defaults() {
         let t = tuner("");
-        assert_eq!(t.firmware, dir().join("mb86m01_assp_osec_idle.bin"));
+        assert_eq!(t.firmware(), dir().join("mb86m01_assp_osec_idle.bin"));
         assert_eq!(
-            t.trc_firmware,
-            Some(dir().join("mb86m01_assp_osec_trc_m_h.bin"))
+            t.trc_firmware(),
+            dir().join("mb86m01_assp_osec_trc_m_h.bin")
         );
-        assert_eq!(t.device, DeviceSel::Index(0));
-        assert_eq!(t.state_file, dir().join("BonDriver_DT295.state"));
+        assert_eq!(t.serial, None);
+        assert_eq!(t.state_file("cd23456789"), dir().join("CD23456789.state"));
         assert!(!t.raw_ts);
         assert_eq!(t.channel_file, None);
     }
@@ -164,64 +159,46 @@ mod tests {
 
     #[test]
     fn values() {
-        let t = tuner(
-            "[tuner]\r\n\
-             firmware = D:\\fw\\idle.bin\r\n\
-             TrcFirmware=\r\n\
-             DeviceIndex=010\r\n\
-             StateFile=\"C:\\state\\dt295.state\"\r\n\
-             RawTS=1\r\n",
-        );
-        assert_eq!(t.firmware, PathBuf::from(r"D:\fw\idle.bin"));
-        assert_eq!(t.trc_firmware, None, "empty: no stream can start");
-        assert_eq!(
-            t.device,
-            DeviceSel::Index(10),
-            "GetPrivateProfileInt: decimal"
-        );
-        assert_eq!(t.state_file, PathBuf::from(r"C:\state\dt295.state"));
+        let t = tuner("[tuner]\r\nRawTS=1\r\n");
         assert!(t.raw_ts);
-        // An empty Firmware= is not the default (Win32: present but empty).
-        assert_eq!(tuner("[Tuner]\nFirmware=\n").firmware, dir());
-        assert_eq!(
-            tuner("[Tuner]\nStateFile=\n").state_file,
-            tuner("").state_file,
-            "empty = the default"
-        );
-        assert_eq!(
-            tuner("[Tuner]\nStateFile=shared.state\n").state_file,
-            dir().join("shared.state")
-        );
+        assert!(!tuner("[Tuner]\nRawTS=0\n").raw_ts);
     }
 
     #[test]
-    fn device_selection() {
-        let device = |text: &str| tuner(text).device;
-        // A serial selects the unit, whatever DeviceIndex says.
+    fn the_unit() {
+        let serial = |text: &str| tuner(text).serial;
         assert_eq!(
-            device("[Tuner]\nDeviceIndex=1\nDeviceSerial= cd23456789 \n"),
-            DeviceSel::Serial("CD23456789".into())
+            serial("[Tuner]\nDeviceSerial= cd23456789 \n"),
+            Some("CD23456789".into())
         );
         assert_eq!(
-            device("[Tuner]\nDeviceSerial=\" cd23456789 \"\n"),
-            DeviceSel::Serial("CD23456789".into()),
+            serial("[Tuner]\nDeviceSerial=\" cd23456789 \"\n"),
+            Some("CD23456789".into()),
             "blanks inside quotes too"
         );
         assert_eq!(
-            device("[Tuner]\nDeviceSerial=\" \"\nDeviceIndex=3\n"),
-            DeviceSel::Index(3),
-            "blank = by index"
+            serial("[Tuner]\nDeviceSerial=\" \"\n"),
+            None,
+            "blank = the only one"
         );
-        assert_eq!(
-            device("[Tuner]\nDeviceIndex=-1\n"),
-            DeviceSel::Index(usize::MAX)
-        );
-        assert_eq!(device("[Tuner]\nDeviceIndex=0x2\n"), DeviceSel::Index(2));
         assert_eq!(DeviceSel::Index(3).to_string(), "DeviceIndex 3");
         assert_eq!(
             DeviceSel::Serial("CD23456789".into()).to_string(),
             "serial CD23456789"
         );
+    }
+
+    #[test]
+    fn retired() {
+        let ini = profile::parse(
+            "[Tuner]\nFirmware=D:\\fw\\idle.bin\nTrcFirmware=\nDeviceIndex=1\nStateFile=x\n",
+        )
+        .unwrap();
+        assert_eq!(retired_keys(&ini), RETIRED_KEYS);
+        let t = Tuner::from_ini(&ini, &dir());
+        assert_eq!(t.firmware(), dir().join(IDLE_FIRMWARE), "not read");
+        assert_eq!(t.serial, None);
+        assert!(retired_keys(&profile::parse("[Tuner]\nRawTS=1\n").unwrap()).is_empty());
     }
 
     #[test]
@@ -234,14 +211,10 @@ mod tests {
         );
         assert_eq!(resolve(&d, "a.bin"), d.join("a.bin"), "a separator added");
         assert_eq!(resolve(Path::new(""), "a.bin"), PathBuf::from("a.bin"));
-        let t = Tuner::from_ini(
-            &profile::parse("[Tuner]\nFirmware=a.bin\n").unwrap(),
-            Path::new(""),
-            Path::new("dt295"),
-        );
+        let t = Tuner::from_ini(&profile::parse("").unwrap(), Path::new(""));
         assert_eq!(
-            (t.firmware, t.state_file),
-            (PathBuf::from("a.bin"), PathBuf::from("dt295.state")),
+            (t.firmware(), t.state_file("a")),
+            (PathBuf::from(IDLE_FIRMWARE), PathBuf::from("A.state")),
             "an ini in the working directory"
         );
     }

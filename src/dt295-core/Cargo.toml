@@ -13,6 +13,14 @@ dt295-usb.workspace = true
 dt295-chdef.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+# where dt295 serve and its clients meet (ipc)
+socket2.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = ["Win32_Networking_WinSock"] }
 
 [lints]
 workspace = true

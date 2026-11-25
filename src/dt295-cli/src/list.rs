@@ -14,8 +14,8 @@ pub fn run() -> Result<()> {
     Ok(())
 }
 
-/// One line per unit: the DeviceIndex it has now (free units only, as the drivers
-/// count them), the serial, whether it is free, and where it is.
+/// One line per unit: the index it has now (free units only, as `-i` counts them), the
+/// serial, whether it is free, and where it is.
 fn render(units: &[Listed]) -> String {
     let mut out = String::from("index  serial        status  location\n");
     let mut index = 0;
@@ -40,8 +40,9 @@ fn render(units: &[Listed]) -> String {
 }
 
 #[cfg(windows)]
-const BUSY_NOTE: &str = "busy = in use by another program, or not bound to WinUSB; it has no \
-                         DeviceIndex now, so the free units' numbers shift -- use DeviceSerial\n";
+const BUSY_NOTE: &str = "busy = in use by another program (dt295 serve, for one), or not bound \
+                         to WinUSB; it has no index now, so the free units' numbers shift -- \
+                         use the serial\n";
 #[cfg(not(windows))]
 const BUSY_NOTE: &str = "busy = in use by another program (dt295 serve, for one); it has no \
                          index now, so the free units' numbers shift -- use the serial\n";

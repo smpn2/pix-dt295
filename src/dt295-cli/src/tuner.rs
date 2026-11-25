@@ -41,11 +41,16 @@ pub struct DeviceArgs {
     #[arg(long, value_name = "SERIAL")]
     pub serial: Option<String>,
 
-    /// A state file (the BonDriver's, BonDriver_DT295.state): use its link key and save
-    /// the key this stream proves, so the next program to open the unit (TVTest, or
-    /// dt295 again) can still decrypt its TS.
+    /// A state file (the unit's, <serial>.state next to the BonDriver or in /var/lib/dt295):
+    /// use its link key and save the key this stream proves, so the next program to open
+    /// the unit (dt295 serve, or dt295 again) can still decrypt its TS.
     #[arg(long, value_name = "FILE")]
     pub state: Option<PathBuf>,
+
+    /// Without `state`: the folder of the unit's state file, `<serial>.state` (a
+    /// BonDriver ini's folder).
+    #[arg(skip)]
+    pub state_dir: Option<PathBuf>,
 }
 
 /// Set by Ctrl-C: stop cleanly (the stream is stopped, the link key saved).
@@ -129,20 +134,27 @@ impl Unit {
         let fw =
             a.fw.as_ref()
                 .context("--fw is required to use the device")?;
+        let mut dev = open_device(a)?;
         // The device keeps applying the link key it handed out first until its secure
         // session lapses; a later process gets a fresh key it never applies. The state
-        // file carries the applied key between processes (the BonDriver's and ours).
-        let state = match &a.state {
-            Some(p) => Some((
-                p.clone(),
-                State::load_settled(p)
+        // file carries the applied key between processes (dt295 serve's and ours).
+        let path = a.state.clone().or_else(|| {
+            let dir = a.state_dir.as_ref()?;
+            let serial = dev.serial()?;
+            Some(dt295::bonini::resolve(
+                dir,
+                &format!("{}.state", serial.to_ascii_uppercase()),
+            ))
+        });
+        let state = match path {
+            Some(p) => {
+                let st = State::load_settled(&p)
                     .with_context(|| format!("cannot read {}", p.display()))?
-                    .unwrap_or_default(),
-            )),
+                    .unwrap_or_default();
+                Some((p, st))
+            }
             None => None,
         };
-
-        let mut dev = open_device(a)?;
         // --trc selects the System1 (EP 0x81) viewing path. Set it BEFORE start: the
         // front-end power-on sequence depends on it.
         if let Some(trc) = &a.trc {

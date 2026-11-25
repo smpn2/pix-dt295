@@ -1,5 +1,5 @@
-//! The host's persistent state file (`BonDriver_DT295.state`), shared by the
-//! BonDriver and the CLI:
+//! The host's persistent state file (`dt295 serve`'s `<serial>.state`; an earlier
+//! BonDriver's `BonDriver_DT295.state`), shared by the daemon and the CLI:
 //!
 //! ```text
 //! # comments
@@ -7,7 +7,7 @@
 //! linkkey <32 hex>
 //! linkkey-pending <32 hex>
 //! psi <kind> <other> <id> <sub> <seen_day> <section hex>
-//! rawchannel <space> <channel>
+//! rawchannel <space> <channel>       (an earlier BonDriver's raw-TS channel; kept as read)
 //! ```
 //! One record per line; unknown keywords (also an older version's `service` lines) are
 //! skipped and go at the next save. Saved via `<file>.<process id>.tmp` and a rename so a

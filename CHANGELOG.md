@@ -1,5 +1,17 @@
 # 変更履歴
 
+## 0.6.0
+
+- BonDriver は個体を直接開かず、DLL のフォルダーの `dt295.exe` で起動した `dt295 serve` を通して視聴するように変更 (使い終わると自動で終了)。
+  `dt295.exe` を DLL と同じフォルダーに置く必要がある
+- BonDriver が、別の TVTest が視聴中の個体を奪わないように変更
+- BonDriver が、ストリームが止まったとき (個体の抜き差しなど) に同じチャンネルを要求し直すように変更
+- BonDriver の ini の `Firmware`、`TrcFirmware`、`StateFile`、`DeviceIndex` を廃止。
+  ファームウェアと状態ファイルは DLL のフォルダーのものを使い、状態ファイルの名前は `<シリアル番号>.state`
+- `dt295 serve` と `dt295 tune` を Windows に対応し、TCP での待ち受けを追加
+- `dt295 serve` を設定ファイルなしでも使えるように変更 (要求された個体を開く)
+- `dt295 tune` と `dt295 mirakc-channels` は、同じ版の `dt295 serve` と使う必要がある
+
 ## 0.5.0
 
 - ほかの BonDriver のチャンネル定義ファイル (BonDriver_BDA の ini、PT の ChSet.txt、BonDriver_PX シリーズの ini) をそのまま読む `[Tuner] ChannelFile` を追加。チューニング空間とチャンネルの番号はそのドライバーと同じ

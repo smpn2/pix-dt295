@@ -1,33 +1,32 @@
 //! The BonDriver object, behind the C++ shim's `IBonDriver2` methods.
 //!
+//! The unit belongs to `dt295 serve` ([`client`]): `OpenTuner` makes sure the daemon of
+//! the DLL's folder answers (starting it if none does), `SetChannel` asks it for the
+//! channel's stream, and the TS it sends goes into the FIFO `GetTsStream` reads. In raw-TS
+//! mode `OpenTuner` also primes the unit ([`Driver::open_tuner`]).
+//!
 //! Threads: TVTest calls `SetChannel` and `GetTsStream` on its streaming thread and
-//! `OpenTuner` / `CloseTuner` / `Release` on another; the idle keeper and the
-//! core's stream worker run their own. The [`Device`] and everything that goes
-//! with it live in one `Mutex`; what the host polls
-//! (`GetSignalLevel`, `GetCurSpace`, `IsTunerOpening`, the FIFO) is readable
-//! without it, so a long `SetChannel` never stalls those calls. The idle keeper may
-//! tune too: a stream started over for the B-CAS card, a unit opened again.
+//! `OpenTuner` / `CloseTuner` / `Release` on another; the client's reader and supervisor
+//! run their own. What the host polls (`GetSignalLevel`, `GetCurSpace`,
+//! `IsTunerOpening`, the FIFO) is readable without waiting for a `SetChannel`.
+//!
+//! [`client`]: crate::client
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::mpsc::{self, RecvTimeoutError};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError, TryLockError};
-use std::thread::{self, JoinHandle};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
-use dt295::bonini::DeviceSel;
 use dt295::chan::{self, Channel, Space};
-use dt295::{
-    CardWatch, Device, Live, RAW_FIRST_TS, RAW_STALL, RAW_STREAM_CAP, System, TsSink, profile,
-    raw_stall_due,
-};
+use dt295::serve::{Mode, Tuning};
+use dt295::{System, TsSink, profile};
 use tracing::level_filters::LevelFilter;
 use tracing::{info, warn};
 
+use crate::client::{Client, SERVER_EXE, Settings, Want};
 use crate::config::{Config, ModulePaths};
 use crate::fifo::{TS_CHUNK, TS_FIFO_SIZE, TsFifo};
 use crate::logging::{self, LogSession};
-use crate::persist::Persist;
 use crate::sys;
 
 /// `GetCurSpace` / `GetCurChannel` before a tune.
@@ -38,19 +37,6 @@ pub const WAIT_TIMEOUT: u32 = 0x102;
 pub const WAIT_ABANDONED: u32 = 0x80;
 /// A `WaitTsStream` timeout meaning "forever" (as is `0`).
 pub const INFINITE: u32 = 0xFFFF_FFFF;
-
-/// How often a unit that went away is looked for again.
-const REOPEN_EVERY: Duration = Duration::from_secs(2);
-/// How often an open unit that is not streaming is checked to be still plugged in (a
-/// stream's worker notices an unplug itself).
-const PRESENCE_EVERY: Duration = Duration::from_secs(5);
-
-/// A nominal C/N reported for a flowing raw-TS stream, the fallback when no live sample is
-/// fresh (the worker samples the live value; see `signal_level`). Non-zero so the host's
-/// signal meter shows the stream is up. The raw-TS timeouts and the stall tracker
-/// (`RAW_STREAM_CAP` / `RAW_FIRST_TS` / `RAW_STALL` / `raw_stall_due`) are shared with the
-/// daemon in `dt295_rawfw`.
-const RAW_NOMINAL_CN_DB: f32 = 30.0;
 
 /// `GetTunerName`.
 pub static TUNER_NAME: [u16; 10] = ascii_wide("PIX-DT295");
@@ -86,28 +72,18 @@ struct SpaceNames {
     channels: Vec<Box<[u16]>>,
 }
 
-/// What the host polls without the device lock (`GetSignalLevel`, `GetCurSpace`,
-/// `IsTunerOpening`, the FIFO), shared with the idle keeper, which may tune again on its
-/// own (a stream started over, a unit opened again).
+/// What the host polls without waiting (`GetCurSpace`, `IsTunerOpening`, the FIFO).
 #[derive(Debug)]
 struct Shared {
     fifo: TsFifo,
-    /// The open device's live values (`GetSignalLevel` without the device lock).
-    live: Mutex<Option<Live>>,
-    /// C/N in dB (`f32` bits): the live value while streaming, else the tune-time one.
-    last_level: AtomicU32,
     cur_space: AtomicU32,
     cur_channel: AtomicU32,
     opening: AtomicBool,
 }
 
 impl Shared {
-    fn set_last_level(&self, db: f32) {
-        self.last_level.store(db.to_bits(), Ordering::Relaxed);
-    }
-
     /// TS lost because the host did not read the FIFO in time (logged per stream;
-    /// separates host-side drops from the device TS's own continuity errors).
+    /// separates host-side drops from the TS's own continuity errors).
     fn log_fifo_drops(&self) {
         let dropped = self.fifo.take_dropped();
         if dropped > 0 {
@@ -116,710 +92,13 @@ impl Shared {
     }
 }
 
-/// The stream's way into the TS FIFO.
-fn fifo_sink(sh: &Arc<Shared>) -> TsSink {
-    let sh = Arc::clone(sh);
-    Box::new(move |ts: &[u8]| sh.fifo.push(ts))
-}
-
-/// Marker: `RawTS=1` selected the blob-free raw-TS path. The worker inside the [`Device`]
-/// brings the chip up from cold, tunes over the host-face I2C, arms the capture engine and
-/// pumps the scrambled TS; the host (TVTest's CAS plugin) descrambles it with a real card.
-/// `None` on [`Core::raw`] = the System1 (idle + trc) viewing path (internal B-CAS reader).
-#[derive(Debug)]
-struct RawMode;
-
-/// Everything the device lock guards.
-#[derive(Debug)]
-struct Core {
-    sh: Arc<Shared>,
-    firmware: PathBuf,
-    trc_firmware: Option<PathBuf>,
-    /// Set = the blob-free raw-TS path (the worker streams the scrambled TS); `None` =
-    /// the System1 viewing path.
-    raw: Option<RawMode>,
-    /// Raw-TS only: the FIFO's received-byte count and when it last advanced, to notice a
-    /// stalled stream (the worker still runs but delivers no TS). `None` while not
-    /// streaming.
-    raw_rx: Option<(u64, Instant)>,
-    /// Raw-TS only: TVTest's channel-scan file (`<module>.ch2`), read to pick a known
-    /// on-air channel to prime on the very first open, before any channel is remembered.
-    ch2_file: Option<PathBuf>,
-    device: DeviceSel,
-    dev: Option<Device>,
-    streaming: bool,
-    /// A re-init after a firmware fault failed: stop retrying until re-open.
-    recovery_failed: bool,
-    spaces: Vec<Space>,
-    persist: Persist,
-    /// The channel the host asked for last: what a start-over or a re-open tunes again.
-    selected: Option<(u32, u32)>,
-    /// When to start the stream over (per opened device).
-    watch: Option<CardWatch>,
-    /// The device went away (unplugged) while open: the unit to open again once it is back,
-    /// by its serial (not `device`: with a `DeviceIndex` another unit plugged in would take
-    /// its number); `None` = none lost.
-    lost: Option<DeviceSel>,
-    next_reopen: Option<Instant>,
-    /// The last check that an open device not streaming is still plugged in.
-    last_presence: Instant,
-}
-
-impl Core {
-    fn save_state(&mut self) {
-        // Raw-TS keeps no link key or PSI (the host descrambles), and reading them
-        // (Device::link_key) locks the proto mutex -- which the raw worker holds for the
-        // whole stream. Calling it from the idle keeper would deadlock the keeper (and so
-        // the close that joins it) against the running worker. Nothing to save here.
-        if self.raw.is_some() {
-            return;
-        }
-        self.persist.save(self.dev.as_ref());
-    }
-
-    fn snapshot_psi(&mut self) {
-        if self.raw.is_some() {
-            return; // raw-TS has no PSI to snapshot, and psi_changed() locks proto (see save_state)
-        }
-        if let Some(dev) = self.dev.as_mut() {
-            self.persist.snapshot_psi(dev);
-        }
-    }
-
-    fn idle_tick(&mut self) {
-        if !self.streaming
-            && let Some(dev) = self.dev.as_mut()
-        {
-            dev.idle_tick(); // the stream worker keeps the session alive while streaming
-        }
-    }
-
-    /// Open the unit `sel` (the configured one, or the one that went away), with retries:
-    /// after a close or a crash the WinUSB handle can linger for a moment. Then select the
-    /// trc firmware, hand over the saved state, and boot it. `who` names the caller in the
-    /// log.
-    fn open_device(&mut self, who: &str, sel: &DeviceSel) -> Option<Device> {
-        let mut dev = match Device::open_sel(sel) {
-            Ok(dev) => dev,
-            Err(e) => {
-                warn!("{who}: cannot open device ({sel}): {e}");
-                return None;
-            }
-        };
-        info!(
-            "{who}: device serial {} ({sel})",
-            dev.serial().unwrap_or("unknown")
-        );
-        if self.raw.is_some() {
-            // Raw-TS: do not boot the idle firmware. The first capture bootstraps the
-            // resident, which needs a cold (freshly plugged) device, so booting anything
-            // here would spend that cold state. Hand the open device over as is.
-            return Some(dev);
-        }
-        // The System1 (EP 0x81) viewing path when a trc firmware is configured. This
-        // MUST precede start(): it picks the front-end power-on sequence from it.
-        if let Some(trc) = &self.trc_firmware {
-            dev.set_trc_firmware(Some(trc.clone()));
-        }
-        self.persist.apply(&mut dev); // link key + PSI; a cold boot drops the key
-        match dev.start(&self.firmware) {
-            Ok(()) => Some(dev),
-            Err(e) => {
-                warn!("{who}: start failed ({e})");
-                None // dropping `dev` closes it
-            }
-        }
-    }
-
-    /// Make a booted device the open one.
-    fn adopt(&mut self, dev: Device) {
-        *lock(&self.sh.live) = Some(dev.live());
-        // Raw-TS has no secure B-CAS session to watch (the host descrambles); the System1
-        // path watches the card to restart the stream after a swap.
-        self.watch = (self.raw.is_none()).then(|| CardWatch::new(&dev.live()));
-        self.dev = Some(dev);
-        self.sh.opening.store(true, Ordering::Release);
-        self.recovery_failed = false;
-        self.lost = None;
-        self.last_presence = Instant::now();
-    }
-
-    /// Stop the running stream (keeping what it taught: PSI, the link key); the firmware
-    /// goes back to idle.
-    fn stop_stream(&mut self) {
-        if self.raw.is_some() {
-            // Raw-TS: stop the worker whenever one is present (not gated on `streaming`):
-            // it holds the device I/O for the whole stream, so it MUST be stopped before
-            // anything else touches the device. Keep the resident for the next
-            // adopt/resume (no re-plug); no PSI / link-key persistence (the host
-            // descrambles).
-            if self.dev.as_ref().is_some_and(Device::raw_present)
-                && let Some(dev) = self.dev.as_mut()
-            {
-                match dev.stream_stop_raw() {
-                    Ok(stats) => info!("raw-TS stream stopped ({} bytes)", stats.bytes),
-                    Err(e) => warn!("raw-TS stream stop failed ({e})"),
-                }
-            }
-            self.streaming = false;
-            self.raw_rx = None;
-            self.sh.log_fifo_drops();
-            return;
-        }
-        if !self.streaming {
-            return;
-        }
-        if let Some(dev) = self.dev.as_mut()
-            && let Err(e) = dev.stream_stop()
-        {
-            warn!("stream stop failed ({e})");
-        }
-        self.streaming = false;
-        self.sh.log_fifo_drops();
-        // Per stop, so a killed host still keeps what the scan so far has seen
-        // (writes only when the PSI or the link key changed).
-        self.snapshot_psi();
-        self.save_state();
-    }
-
-    /// `SetChannel(space, channel)`: stop the previous stream, re-init a faulted
-    /// device (once per open), tune, and start the stream of a locked channel.
-    /// True only when a stream runs.
-    fn set_channel(&mut self, space: u32, channel: u32) -> bool {
-        let (si, ci) = (space as usize, channel as usize);
-        let Some(ch) = self.spaces.get(si).and_then(|s| s.channels.get(ci)) else {
-            return false;
-        };
-        if let Some(why) = &ch.untunable {
-            info!(
-                "SetChannel({space}, {channel}): {} is no channel to tune ({why})",
-                ch.name
-            );
-            return false;
-        }
-        let &Channel {
-            sys,
-            freq_hz,
-            tsid,
-            sid,
-            ..
-        } = ch;
-        if self.dev.is_none() && self.lost.is_some() {
-            self.try_reopen(); // re-plugged, and a tune came before the keeper saw it back
-        }
-        if self.dev.is_none() {
-            return false;
-        }
-
-        if self.raw.is_some() {
-            return self.set_channel_raw(space, channel, sys, freq_hz, tsid, sid);
-        }
-
-        // A channel change restarts the stream: stop the previous one (returns the
-        // firmware to idle) before re-tuning.
-        let t_begin = Instant::now();
-        self.stop_stream();
-        let Some(dev) = self.dev.as_mut() else {
-            return false;
-        };
-        // A faulted (0xFFFF) or non-acking firmware makes every tune fail fast and
-        // the host give up. Try one full re-init so the session recovers without a
-        // re-plug; only once per open (if it fails the device needs a re-plug).
-        if !self.recovery_failed && dev.needs_recovery() {
-            info!("device faulted / not acking -- attempting re-init");
-            match dev.start(&self.firmware) {
-                Ok(()) => info!("re-init succeeded; device recovered"),
-                Err(e) => {
-                    info!("re-init FAILED; a USB re-plug is needed ({e})");
-                    self.recovery_failed = true;
-                }
-            }
-        }
-        let t_stop = Instant::now();
-        let mut t_tune;
-        let mut retried = false;
-        let (tuned, locked, cn_db, cn_raw) = loop {
-            let Some(dev) = self.dev.as_mut() else {
-                return false;
-            };
-            let tuned = match sys {
-                System::Terrestrial => dev.tune_t(freq_hz),
-                System::Satellite => dev.tune_s(freq_hz, tsid),
-            };
-            t_tune = Instant::now();
-            let mut locked = false;
-            let mut cn_db = -1.0f32; // for the log line below
-            let mut cn_raw = 0u32;
-            match &tuned {
-                Err(e) => warn!("tune failed ({e})"),
-                Ok(()) => {
-                    self.sh.cur_space.store(space, Ordering::Release);
-                    self.sh.cur_channel.store(channel, Ordering::Release);
-                    // The tune already waited for lock; read it once for the level.
-                    if let Ok(st) = dev.read_status(sys) {
-                        let db = st.cn_mdb as f32 / 1000.0;
-                        self.sh.set_last_level(db);
-                        locked = st.locked;
-                        cn_db = db;
-                        cn_raw = st.raw;
-                    }
-                    // Only stream a locked channel: on an empty one the bring-up and PAT
-                    // probe would take tens of seconds for nothing and time a scan out.
-                    if locked {
-                        // every service of the TS, unless the ini names one
-                        dev.set_service_id(sid);
-                        self.sh.fifo.purge();
-                        match dev.stream_start(fifo_sink(&self.sh)) {
-                            Ok(()) => self.streaming = true,
-                            Err(e) => warn!("stream start failed ({e})"),
-                        }
-                    }
-                }
-            }
-            // The firmware faulted during this tune -- seen when a unit is opened about a
-            // minute after the previous process closed it: that session's timeout comes in
-            // the new one. Start it again and tune once more (about 4 s, within the host's
-            // 10 s for a channel change) instead of failing this one.
-            let faulted = !self.streaming && self.dev.as_mut().is_some_and(|d| d.needs_recovery());
-            if faulted && !retried && !self.recovery_failed {
-                retried = true;
-                info!("the firmware faulted during the tune -- re-init and tune once more");
-                if let Some(dev) = self.dev.as_mut() {
-                    match dev.start(&self.firmware) {
-                        Ok(()) => continue,
-                        Err(e) => {
-                            info!("re-init FAILED; a USB re-plug is needed ({e})");
-                            self.recovery_failed = true;
-                        }
-                    }
-                }
-            }
-            break (tuned, locked, cn_db, cn_raw);
-        };
-        let t_end = Instant::now();
-        let timing = [
-            t_stop - t_begin,
-            t_tune - t_stop,
-            t_end - t_tune,
-            t_end - t_begin,
-        ];
-        info!(
-            "{}",
-            set_channel_line(freq_hz, locked, cn_db, cn_raw, timing)
-        );
-        // Success means a stream is running (a locked channel whose stream failed to
-        // start must not look "tuned" with no TS).
-        tuned.is_ok() && locked && self.streaming
-    }
-
-    /// Raw-TS: prime the blob-free datapath during `OpenTuner` so TVTest's first
-    /// `SetChannel` is fast. The one-time cold bring-up (board, demod INITIALIZE, a tune)
-    /// runs here instead of on the first `SetChannel`, during which a host's viewer would
-    /// otherwise starve on no TS and never start -- the first channel then stays black until
-    /// a channel change rebuilds it. We prime on the last-viewed channel (it locked before,
-    /// so it locks again) and leave the chip brought up, so the first `SetChannel` only
-    /// retunes + rearms in about a second. The bring-up time is unchanged -- it moves from
-    /// the first `SetChannel` to the open. A no-op outside raw mode, or until a channel is
-    /// remembered.
-    fn prime_raw(&mut self) {
-        if self.raw.is_none() {
-            return;
-        }
-        // The last-viewed channel if we have one, else a known on-air channel from TVTest's
-        // scan file so the very first open primes too. With neither (no state and no scan),
-        // leave the device cold: the first SetChannel does the full bring-up (slow, and a
-        // host may show that channel black until a channel change); the channel is remembered
-        // after.
-        let Some((space, channel)) = self
-            .persist
-            .raw_channel()
-            .or_else(|| self.first_scanned_terrestrial())
-        else {
-            return;
-        };
-        if self.set_channel(space, channel) {
-            // Keep the brought-up chip but stop the prime stream: the monitor stays installed
-            // on the chip, so the first host `SetChannel` probes it, skips the bring-up and
-            // only retunes + rearms.
-            self.stop_stream();
-            self.sh.fifo.purge();
-            // The prime stream is stopped and nothing flows yet: report no selection and no
-            // signal until the first real SetChannel starts a worker, so GetCurChannel /
-            // GetSignalLevel do not look tuned-and-streaming.
-            self.sh.cur_space.store(NO_SELECTION, Ordering::Release);
-            self.sh.cur_channel.store(NO_SELECTION, Ordering::Release);
-            self.sh.set_last_level(0.0);
-            info!("raw-TS: primed the datapath at open; the first SetChannel will be fast");
-        } else {
-            // It did not lock (off air now, or the lineup changed). The board is still brought
-            // up (the monitor is installed), so the first SetChannel only retunes + rearms.
-            warn!("raw-TS: priming tune did not lock; the first SetChannel will retune");
-        }
-    }
-
-    /// The `(space, channel)` of the first enabled terrestrial service in TVTest's `.ch2`
-    /// scan file: a channel the host already found on air, so priming on it locks. Used on
-    /// the first open, before a channel has been remembered. None if the file is
-    /// absent/unreadable or names no usable terrestrial channel.
-    fn first_scanned_terrestrial(&self) -> Option<(u32, u32)> {
-        let services = dt295::ch2::read(self.ch2_file.as_ref()?).ok()?;
-        first_terrestrial_ch2_channel(&services, |space, channel| {
-            self.spaces
-                .get(space as usize)
-                .and_then(|sp| sp.channels.get(channel as usize))
-                .is_some_and(|c| c.sys == System::Terrestrial && c.untunable.is_none())
-        })
-    }
-
-    /// `SetChannel` on the raw-TS path: the blob-free cold path (bring the chip up on the
-    /// first tune, retune + rearm on a channel change). True once TS is flowing. The whole
-    /// scrambled TS is streamed; the host (TVTest's CAS plugin) picks and descrambles the
-    /// service, so the per-channel ServiceID is not used here.
-    fn set_channel_raw(
-        &mut self,
-        space: u32,
-        channel: u32,
-        sys: System,
-        freq_hz: u32,
-        tsid: u16,
-        sid: Option<u16>,
-    ) -> bool {
-        let _ = sid;
-        self.set_channel_cold(space, channel, sys, freq_hz, tsid)
-    }
-
-    /// Whether the chip's blob-free datapath is already brought up (our monitor BODY is on
-    /// the chip). Probed on the device so it survives worker restarts and a reopen without a
-    /// re-plug; false when no device is open, so the next tune does the full bring-up. Only
-    /// call it with no worker running (it does host device I/O).
-    fn cold_monitor_present(&self) -> bool {
-        self.dev
-            .as_ref()
-            .is_some_and(Device::cold_monitor_installed)
-    }
-
-    /// Fully blob-free cold raw-TS channel set: stop the previous worker, then bring the
-    /// chip up, tune over the host face and arm the capture engine on the new frequency, and
-    /// start a worker streaming to the FIFO. A channel change is a full stop + fresh start
-    /// (no resident, so nothing to adopt/resume).
-    fn set_channel_cold(
-        &mut self,
-        space: u32,
-        channel: u32,
-        sys: System,
-        freq_hz: u32,
-        tsid: u16,
-    ) -> bool {
-        let t_begin = Instant::now();
-        self.stop_stream();
-        // If the previous worker could not be stopped (it still holds the device I/O lock for
-        // the whole capture), any host-side device access below -- cold_monitor_present or the
-        // stream start -- would block on that lock forever. Bail out; a re-plug is the reset.
-        if self.dev.as_ref().is_some_and(Device::raw_present) {
-            warn!("cold raw-TS: the previous worker did not stop; aborting (re-plug to reset)");
-            return false;
-        }
-        let terrestrial = matches!(sys, System::Terrestrial);
-        let tsid = match sys {
-            System::Satellite => Some(tsid),
-            System::Terrestrial => None,
-        };
-        // Decide the bring-up from the chip itself, not a flag: our monitor BODY persists on
-        // the chip across worker restarts, a no-lock (off-air) tune and a reopen without a
-        // re-plug, and clears only when a re-plug wipes RAM. The first tune after a cold open
-        // then does the whole bring-up; a later channel change (the board already up) only
-        // retunes + rearms, which is much faster. A flag set on "TS flowed" would instead mark
-        // an off-air-but-brought-up chip cold and re-run the once-per-plug bootstrap (which faults).
-        let full = !self.cold_monitor_present();
-        let flowing = self.start_cold_and_wait(terrestrial, freq_hz, tsid, full);
-        if flowing {
-            self.persist.save_raw_channel(space, channel);
-            self.sh.cur_space.store(space, Ordering::Release);
-            self.sh.cur_channel.store(channel, Ordering::Release);
-            self.sh.set_last_level(RAW_NOMINAL_CN_DB);
-        } else {
-            // The worker ends on its own, in about a tune's time, when the demod does not
-            // lock; only a worker still running at the deadline waited the whole time.
-            if self.dev.as_ref().is_some_and(Device::raw_running) {
-                warn!("cold raw-TS: no TS within {RAW_FIRST_TS:?}; stopping");
-            } else {
-                warn!("cold raw-TS: no TS (the worker ended: no lock, or the bring-up failed)");
-            }
-            self.stop_stream();
-            self.sh.set_last_level(0.0);
-        }
-        info!(
-            "{}",
-            set_channel_line(
-                freq_hz,
-                flowing,
-                if flowing { RAW_NOMINAL_CN_DB } else { -1.0 },
-                0,
-                [
-                    Duration::ZERO,
-                    Duration::ZERO,
-                    t_begin.elapsed(),
-                    t_begin.elapsed(),
-                ],
-            )
-        );
-        flowing
-    }
-
-    /// Start a cold blob-free raw-TS worker on `freq_hz` and wait (bounded) for the first TS.
-    /// `full` does the one-time cold bring-up; a channel change (the board already up) passes
-    /// false and only retunes + rearms.
-    fn start_cold_and_wait(
-        &mut self,
-        terrestrial: bool,
-        freq_hz: u32,
-        tsid: Option<u16>,
-        full: bool,
-    ) -> bool {
-        self.sh.fifo.purge();
-        let started = {
-            let Some(dev) = self.dev.as_mut() else {
-                return false;
-            };
-            dev.stream_start_cold(
-                terrestrial,
-                freq_hz,
-                tsid,
-                full,
-                RAW_STREAM_CAP,
-                fifo_sink(&self.sh),
-            )
-        };
-        if let Err(e) = started {
-            warn!("cold raw-TS: stream start failed ({e})");
-            return false;
-        }
-        self.streaming = true;
-        self.wait_raw_ts(RAW_FIRST_TS)
-    }
-
-    /// Wait (bounded) for the raw-TS worker to deliver TS into the FIFO, or until the
-    /// worker ends (a fault or an unplug before any TS).
-    fn wait_raw_ts(&self, within: Duration) -> bool {
-        // Key on the FIFO's monotonic received count, not ready_count: a host reading the FIFO
-        // concurrently (EDCB, BonDriverProxyEx) can drain ready_count to 0 even while TS flows,
-        // so a received count that advances past where it started is the arrival signal.
-        let base = self.sh.fifo.received();
-        let t0 = Instant::now();
-        while t0.elapsed() < within {
-            if self.sh.fifo.received() > base {
-                return true;
-            }
-            if !self.dev.as_ref().is_some_and(Device::raw_running) {
-                return false; // the worker ended before any TS
-            }
-            thread::sleep(Duration::from_millis(50));
-        }
-        self.sh.fifo.received() > base
-    }
-
-    /// The idle keeper's checks, once a second: a unit that went away is closed and
-    /// opened again once it is back (and the channel tuned again); a stream is started
-    /// over for the B-CAS card or a firmware that stopped acking ([`CardWatch`]).
-    fn watch_tick(&mut self) {
-        if self.raw.is_some() {
-            self.watch_tick_raw();
-            return;
-        }
-        let now = Instant::now();
-        let gone = match self.dev.as_ref() {
-            Some(dev) if dev.live().device_lost() => true,
-            // a stream's worker notices an unplug itself; an idle device is looked for
-            Some(_)
-                if !self.streaming && now.duration_since(self.last_presence) >= PRESENCE_EVERY =>
-            {
-                self.last_presence = now;
-                !self.present()
-            }
-            _ => false,
-        };
-        if gone {
-            warn!("the device is gone (unplugged?): closed it; it is opened again when it is back");
-            self.drop_device();
-        }
-        if self.lost.is_some() {
-            if self.next_reopen.is_none_or(|t| now >= t) {
-                self.next_reopen = Some(now + REOPEN_EVERY);
-                if self.try_reopen()
-                    && let Some((space, channel)) = self.selected
-                {
-                    self.set_channel(space, channel);
-                }
-            }
-            return;
-        }
-        if !self.streaming {
-            return;
-        }
-        let stalled = self.dev.as_mut().is_some_and(Device::needs_recovery);
-        let over = match (self.dev.as_ref(), self.watch.as_mut()) {
-            (Some(dev), Some(w)) => w.poll(&dev.live(), stalled, now),
-            _ => None,
-        };
-        if let Some(over) = over {
-            info!("{}: starting the stream over", over.why);
-            self.start_over(over.in_place);
-            if let Some(w) = self.watch.as_mut() {
-                w.started_over(Instant::now());
-            }
-        }
-    }
-
-    /// The idle keeper's check on the raw-TS path. While a raw stream runs the worker owns
-    /// the device, so this never touches it (no proto access, no `needs_recovery`): it only
-    /// reaps a worker that ended on its own (a capture fault or an unplug) and arranges a
-    /// re-open. There is no B-CAS session to watch (the host descrambles).
-    fn watch_tick_raw(&mut self) {
-        let now = Instant::now();
-        if self.lost.is_some() {
-            if self.next_reopen.is_none_or(|t| now >= t) {
-                self.next_reopen = Some(now + REOPEN_EVERY);
-                if self.try_reopen()
-                    && let Some((space, channel)) = self.selected
-                {
-                    self.set_channel(space, channel);
-                }
-            }
-            return;
-        }
-        if self.streaming {
-            // The worker ended on its own (the slot is filled but the thread is done):
-            // reap it (which logs why) and stop streaming.
-            let ended = self.dev.as_ref().is_some_and(Device::raw_present)
-                && !self.dev.as_ref().is_some_and(Device::raw_running);
-            if ended {
-                warn!("raw-TS: the stream worker ended on its own; reaping it");
-                self.stop_stream();
-                if !self.present() {
-                    warn!("the device is gone (unplugged?): closed it; opened again when back");
-                    self.drop_device();
-                    return;
-                }
-                // Still plugged in: a capture fault, not an unplug. Restart the selected
-                // channel so the stream recovers (bounded by RAW_FIRST_TS; a hard fault
-                // returns no-lock and leaves the stream stopped, so this does not spin).
-                if let Some((space, channel)) = self.selected {
-                    warn!("raw-TS: restarting the selected channel after the worker ended");
-                    self.set_channel(space, channel);
-                }
-                return;
-            }
-            // The worker is still running but may be delivering nothing (a stalled
-            // datapath; the blob-free halt means a stall never faults the worker). The
-            // FIFO's received-byte count is the only liveness signal: if it has not
-            // advanced for RAW_STALL, restart the selected channel (stop the stalled
-            // worker + re-tune) -- a transient stall recovers, a hard one reports no-lock.
-            let rx = self.sh.fifo.received();
-            if raw_stall_due(&mut self.raw_rx, rx, now) {
-                warn!(
-                    "raw-TS: no TS for {RAW_STALL:?} while streaming -- datapath stalled; restarting"
-                );
-                if let Some((space, channel)) = self.selected {
-                    self.set_channel(space, channel);
-                }
-            }
-            return;
-        }
-        // Not streaming: check an open device is still plugged in (no device I/O).
-        if self.dev.is_some() && now.duration_since(self.last_presence) >= PRESENCE_EVERY {
-            self.last_presence = now;
-            if !self.present() {
-                warn!("the device is gone (unplugged?): closed it; opened again when back");
-                self.drop_device();
-            }
-        }
-    }
-
-    /// Whether the unit is plugged in (true when that cannot be told): the open one by its
-    /// serial, else the one that went away, else the configured one ([`unit_present`]).
-    fn present(&self) -> bool {
-        let open = self.dev.as_ref().and_then(Device::serial);
-        let sel = self.lost.as_ref().unwrap_or(&self.device);
-        dt295::present_serials().map_or(true, |serials| unit_present(&serials, sel, open))
-    }
-
-    /// Close a device that went away; [`Core::watch_tick`] opens it again.
-    fn drop_device(&mut self) {
-        if self.streaming {
-            if let Some(dev) = self.dev.as_mut() {
-                let _ = dev.stream_stop(); // the worker ends; the device does not answer
-            }
-            self.streaming = false;
-            self.sh.log_fifo_drops();
-        }
-        self.snapshot_psi();
-        self.save_state();
-        *lock(&self.sh.live) = None;
-        // the same unit comes back, not whichever takes its DeviceIndex
-        let serial = self.dev.as_ref().and_then(Device::serial);
-        self.lost = Some(serial.map_or_else(
-            || self.device.clone(),
-            |s| DeviceSel::Serial(s.to_ascii_uppercase()),
-        ));
-        self.dev = None; // closes it
-        self.watch = None;
-        self.next_reopen = None;
-        // The chip resets on a re-plug, so the next tune does the full cold bring-up again;
-        // that is decided by probing the chip (no monitor present), not tracked here.
-    }
-
-    /// Open the unit that went away, if it is back. True when it is open again.
-    fn try_reopen(&mut self) -> bool {
-        let Some(sel) = self.lost.clone() else {
-            return false;
-        };
-        if !self.present() {
-            return false;
-        }
-        match self.open_device("reopen", &sel) {
-            Some(dev) => {
-                info!("the device is back: opened it again");
-                self.adopt(dev);
-                true
-            }
-            None => false,
-        }
-    }
-
-    /// Start the stream of the selected channel over on a re-initialized device: what
-    /// brings a B-CAS card back (a channel change alone does not).
-    fn start_over(&mut self, in_place: bool) {
-        let Some((space, channel)) = self.selected else {
-            return;
-        };
-        self.stop_stream();
-        let Some(dev) = self.dev.as_mut() else {
-            return;
-        };
-        if in_place && dev.resume_in_place(fifo_sink(&self.sh)) {
-            self.streaming = true;
-            return;
-        }
-        if let Err(e) = dev.start(&self.firmware) {
-            warn!("re-init failed ({e})");
-        }
-        if !self.set_channel(space, channel) {
-            warn!("the channel did not stream again");
-        }
-    }
-}
-
-/// The idle session keeper thread and its stop signal (dropping `stop` ends it).
-#[derive(Debug)]
-struct IdleKeeper {
-    stop: mpsc::Sender<()>,
-    thread: JoinHandle<()>,
-}
-
 /// One BonDriver instance.
 #[derive(Debug)]
 pub struct Driver {
-    core: Arc<Mutex<Core>>,
+    settings: Settings,
+    spaces: Vec<Space>,
+    /// TVTest's channel-scan file, for the raw-TS prime.
+    ch2_file: Option<PathBuf>,
     sh: Arc<Shared>,
     names: Vec<SpaceNames>,
     /// What `SetChannel(BYTE)` tunes for UHF 13-62ch (index `n - 13`): the first channel
@@ -827,7 +106,8 @@ pub struct Driver {
     uhf: Vec<Option<(u32, u32)>>,
     /// The buffer behind `GetTsStream(BYTE **)`.
     out: Mutex<Box<[u8]>>,
-    idle: Mutex<Option<IdleKeeper>>,
+    /// The connection to `dt295 serve` while the tuner is open.
+    client: Mutex<Option<Arc<Client>>>,
     log: Mutex<Option<LogSession>>,
 }
 
@@ -838,8 +118,7 @@ const _: () = {
 };
 
 impl Driver {
-    /// The driver as `CreateBonDriver` makes it: the ini next to the DLL, its log
-    /// file, the state file.
+    /// The driver as `CreateBonDriver` makes it: the ini next to the DLL, its log file.
     pub fn new() -> Self {
         logging::init();
         let paths = sys::module_path()
@@ -870,6 +149,12 @@ impl Driver {
                 ini_path.display()
             );
         }
+        for key in &cfg.retired {
+            warn!(
+                "ini: [Tuner] {key} is no longer read: the unit belongs to {SERVER_EXE} serve, \
+                 whose firmware and state files are those of the DLL's folder"
+            );
+        }
         match &cfg.channel_file_log {
             Ok(lines) => lines.iter().for_each(|l| info!("ini: {l}")),
             Err(e) => warn!("ini: {e}; no tuning spaces"),
@@ -877,157 +162,133 @@ impl Driver {
         Self::with_config(cfg, log)
     }
 
-    /// A driver for `cfg` (the state is loaded now: the spaces are built).
+    /// A driver for `cfg`.
     pub fn with_config(cfg: Config, log: Option<LogSession>) -> Self {
-        let spaces = cfg.spaces;
-        let ch2_file = cfg.ch2_file;
-        let mut persist = Persist::new(cfg.state_file);
-        persist.load();
-        let names = spaces
+        let names = cfg
+            .spaces
             .iter()
             .map(|s| SpaceNames {
                 name: wide_z(&s.name),
                 channels: s.channels.iter().map(|c| wide_z(&c.name)).collect(),
             })
             .collect();
-        let uhf = uhf_channels(&spaces);
+        let uhf = uhf_channels(&cfg.spaces);
         let sh = Arc::new(Shared {
             fifo: TsFifo::new(TS_FIFO_SIZE),
-            live: Mutex::new(None),
-            last_level: AtomicU32::new(0f32.to_bits()),
             cur_space: AtomicU32::new(NO_SELECTION),
             cur_channel: AtomicU32::new(NO_SELECTION),
             opening: AtomicBool::new(false),
         });
-        let raw = cfg.raw_ts.then(|| {
-            info!(
-                "raw-TS mode: blob-free cold path (no resident, no aux core, no vendor firmware)"
-            );
-            RawMode
-        });
         Self {
-            core: Arc::new(Mutex::new(Core {
-                sh: Arc::clone(&sh),
-                firmware: cfg.firmware,
-                trc_firmware: cfg.trc_firmware,
-                raw,
-                raw_rx: None,
-                ch2_file,
-                device: cfg.device,
-                dev: None,
-                streaming: false,
-                recovery_failed: false,
-                spaces,
-                persist,
-                selected: None,
-                watch: None,
-                lost: None,
-                next_reopen: None,
-                last_presence: Instant::now(),
-            })),
+            settings: cfg.settings(),
+            spaces: cfg.spaces,
+            ch2_file: cfg.ch2_file,
             sh,
             names,
             uhf,
             out: Mutex::new(vec![0; TS_CHUNK].into_boxed_slice()),
-            idle: Mutex::new(None),
+            client: Mutex::new(None),
             log: Mutex::new(log),
         }
     }
 
-    // ---- tuner ----
-
-    /// `OpenTuner`: open (with retries), select the trc firmware and hand over the
-    /// saved state (read again if another program may have written it since), then boot.
-    /// Already open: just make sure the keeper runs. A unit that went away and was not
-    /// closed since is the one to open, not whichever has its `DeviceIndex` now.
-    pub fn open_tuner(&self) -> bool {
-        let ok = {
-            let mut core = lock(&self.core);
-            if core.dev.is_some() {
-                true
-            } else {
-                core.persist.reload();
-                let sel = core.lost.clone().unwrap_or_else(|| core.device.clone());
-                match core.open_device("OpenTuner", &sel) {
-                    Some(dev) => {
-                        core.adopt(dev);
-                        core.prime_raw();
-                        true
-                    }
-                    None => false,
-                }
-            }
-        };
-        if ok {
-            self.start_idle_keeper();
-        }
-        ok
+    fn client(&self) -> Option<Arc<Client>> {
+        lock(&self.client).clone()
     }
 
-    /// `CloseTuner`: stop the stream, save, close; the selection is forgotten.
-    pub fn close_tuner(&self) {
-        self.stop_idle_keeper(); // before taking the device lock: the keeper uses it too
-        {
-            let mut core = lock(&self.core);
-            if core.dev.is_some() {
-                core.stop_stream();
-                core.snapshot_psi();
-                core.save_state();
-                *lock(&self.sh.live) = None;
-                core.dev = None; // closes the device
-            }
-            self.sh.opening.store(false, Ordering::Release);
-            core.recovery_failed = false;
-            core.selected = None;
-            core.watch = None;
-            core.lost = None;
-            self.sh.cur_space.store(NO_SELECTION, Ordering::Release);
-            self.sh.cur_channel.store(NO_SELECTION, Ordering::Release);
-            self.sh.set_last_level(0.0);
+    // ---- tuner ----
+
+    /// `OpenTuner`: make sure `dt295 serve` answers at the DLL's folder, starting it if
+    /// none does. Without a unit the daemon still answers: the first `SetChannel` fails,
+    /// and the channel is asked for again once the unit is there. In raw-TS mode the unit
+    /// is primed ([`Driver::prime_raw`]).
+    pub fn open_tuner(&self) -> bool {
+        let mut client = lock(&self.client);
+        if client.is_some() {
+            return true;
         }
+        let sink = {
+            let sh = Arc::clone(&self.sh);
+            Box::new(move || -> TsSink {
+                let sh = Arc::clone(&sh);
+                Box::new(move |ts: &[u8]| sh.fifo.push(ts))
+            })
+        };
+        match Client::open(self.settings.clone(), sink) {
+            Ok(c) => {
+                if self.settings.mode == Mode::RawTs {
+                    self.prime_raw(&c);
+                }
+                *client = Some(Arc::new(c));
+                self.sh.opening.store(true, Ordering::Release);
+                true
+            }
+            Err(e) => {
+                warn!("OpenTuner: {e}");
+                false
+            }
+        }
+    }
+
+    /// Raw-TS: stream a known on-air channel once during `OpenTuner`, so that TVTest's
+    /// first `SetChannel` is fast. The one-time cold bring-up of a freshly plugged unit
+    /// (board, demod INITIALIZE, a tune: about 2.5 s) runs here instead of in the first
+    /// `SetChannel`, during which TVTest's viewer would starve on no TS and never start --
+    /// the first channel would stay black until a channel change. The channel is the first
+    /// enabled terrestrial service of TVTest's scan (`.ch2`); without one the unit stays as
+    /// it is. The chip stays brought up (the daemon tells that from the chip), so the first
+    /// `SetChannel` only retunes and rearms. The bring-up time is unchanged: it moves from
+    /// the first `SetChannel` to the open.
+    fn prime_raw(&self, client: &Client) {
+        let Some((space, channel)) = self.first_scanned_terrestrial() else {
+            return;
+        };
+        let ch = &self.spaces[space as usize].channels[channel as usize];
+        let t0 = Instant::now();
+        let primed = client.set_channel(want(ch), || {});
+        client.stop();
+        self.purge_ts_stream();
+        match primed {
+            Ok(_) => info!(
+                "raw-TS: primed the unit on {} at the open ({} ms); the first SetChannel will \
+                 be fast",
+                ch.name,
+                t0.elapsed().as_millis()
+            ),
+            Err(e) => warn!("raw-TS: priming on {} did not stream ({e})", ch.name),
+        }
+    }
+
+    /// The `(space, channel)` of the first enabled terrestrial service in TVTest's `.ch2`
+    /// scan file: a channel TVTest already found on air, so priming on it locks. `None` if
+    /// the file is absent or unreadable, or names no terrestrial channel to tune.
+    fn first_scanned_terrestrial(&self) -> Option<(u32, u32)> {
+        let services = dt295::ch2::read(self.ch2_file.as_ref()?).ok()?;
+        first_terrestrial_ch2_channel(&services, |space, channel| {
+            self.spaces
+                .get(space as usize)
+                .and_then(|sp| sp.channels.get(channel as usize))
+                .is_some_and(|c| c.sys == System::Terrestrial && c.untunable.is_none())
+        })
+    }
+
+    /// `CloseTuner`: end the stream (the daemon ends with its last client); the
+    /// selection is forgotten.
+    pub fn close_tuner(&self) {
+        let client = lock(&self.client).take();
+        if let Some(c) = client {
+            c.close();
+            self.sh.log_fifo_drops();
+        }
+        self.sh.opening.store(false, Ordering::Release);
+        self.sh.cur_space.store(NO_SELECTION, Ordering::Release);
+        self.sh.cur_channel.store(NO_SELECTION, Ordering::Release);
         self.purge_ts_stream();
     }
 
     /// `IsTunerOpening`.
     pub fn is_tuner_opening(&self) -> bool {
         self.sh.opening.load(Ordering::Acquire)
-    }
-
-    // ---- idle session keeper ----
-    //
-    // The System1 secure session must see a keepalive within a minute or the firmware
-    // faults to 0xFFFF, also while idle. While streaming the core's worker sends it,
-    // during a tune the tune path does; when nothing at all happens (TVTest showing
-    // a scan-result dialog, parked on an empty channel) this thread does, ticking
-    // once a second (Device::idle_tick only touches the device when one is due).
-    // The same tick starts a stream over for the B-CAS card (a card pulled or put in
-    // leaves the stream running scrambled) and opens a unit again after a re-plug,
-    // tuning the selected channel again (Core::watch_tick).
-    // try_lock: it never stalls behind a long SetChannel (which keeps the session
-    // alive itself) or CloseTuner.
-
-    fn start_idle_keeper(&self) {
-        let mut idle = lock(&self.idle);
-        if idle.is_some() {
-            return;
-        }
-        let (stop, stopped) = mpsc::channel();
-        let core = Arc::clone(&self.core);
-        match thread::Builder::new()
-            .name("BonDriver_DT295 idle".into())
-            .spawn(move || idle_keeper(&core, &stopped))
-        {
-            Ok(thread) => *idle = Some(IdleKeeper { stop, thread }),
-            Err(e) => warn!("idle keeper: cannot start its thread ({e})"),
-        }
-    }
-
-    fn stop_idle_keeper(&self) {
-        let keeper = lock(&self.idle).take();
-        if let Some(IdleKeeper { stop, thread }) = keeper {
-            drop(stop);
-            let _ = thread.join(); // at most one in-flight keepalive
-        }
     }
 
     // ---- channels ----
@@ -1070,38 +331,58 @@ impl Driver {
         }
     }
 
-    /// `SetChannel(space, channel)`: stop the previous stream, re-init a faulted
-    /// device (once per open), tune, and start the stream of a locked channel.
-    /// True only when a stream runs.
+    /// `SetChannel(space, channel)`: ask `dt295 serve` for the channel's stream (every
+    /// service of the TS, or the channel's ServiceID). True only when a stream runs.
     pub fn set_channel(&self, space: u32, channel: u32) -> bool {
-        let mut core = lock(&self.core);
-        let known = core
+        let Some(ch) = self
             .spaces
             .get(space as usize)
             .and_then(|s| s.channels.get(channel as usize))
-            .is_some_and(|c| c.untunable.is_none());
-        if known {
-            core.selected = Some((space, channel));
-            if let Some(w) = core.watch.as_mut() {
-                w.tuned();
+        else {
+            return false;
+        };
+        if let Some(why) = &ch.untunable {
+            info!(
+                "SetChannel({space}, {channel}): {} is no channel to tune ({why})",
+                ch.name
+            );
+            return false;
+        }
+        let Some(client) = self.client() else {
+            return false; // not open
+        };
+        self.sh.log_fifo_drops();
+        let t0 = Instant::now();
+        // emptied once the old stream's reader is gone, so none of its TS comes after
+        let result = client.set_channel(want(ch), || self.purge_ts_stream());
+        let ms = t0.elapsed().as_millis();
+        match result {
+            Ok(cn_mdb) => {
+                info!(
+                    "SetChannel({space}, {channel}) {} {:.3} MHz: streaming{} ({ms} ms)",
+                    ch.name,
+                    f64::from(ch.freq_hz) / 1e6,
+                    cn_mdb.map_or_default(|cn| format!(", C/N {:.1} dB", f64::from(cn) / 1000.0))
+                );
+                self.sh.cur_space.store(space, Ordering::Release);
+                self.sh.cur_channel.store(channel, Ordering::Release);
+                true
+            }
+            Err(why) => {
+                warn!(
+                    "SetChannel({space}, {channel}) {} {:.3} MHz: {why} ({ms} ms)",
+                    ch.name,
+                    f64::from(ch.freq_hz) / 1e6
+                );
+                false
             }
         }
-        core.set_channel(space, channel)
     }
 
-    /// `GetSignalLevel`: C/N in dB. Never touches the device (the host polls it
-    /// continuously): while streaming the worker's live sample, else the value read
-    /// at `SetChannel`.
+    /// `GetSignalLevel`: C/N in dB, as `dt295 serve` last told it (never waits); 0
+    /// without a stream.
     pub fn signal_level(&self) -> f32 {
-        // No `is_streaming()` gate: the raw-TS worker samples the C/N over the aux through
-        // `with_io`, which keeps the device's `streaming()` false, so a fresh sample (the
-        // freshness check inside `cn_mdb`) is what says a worker is publishing a live level.
-        if let Some(live) = lock(&self.sh.live).as_ref()
-            && let Some(cn) = live.cn_mdb()
-        {
-            self.sh.set_last_level(cn as f32 / 1000.0);
-        }
-        f32::from_bits(self.sh.last_level.load(Ordering::Relaxed))
+        self.client().map_or(0.0, |c| c.signal_level())
     }
 
     // ---- TS FIFO ----
@@ -1169,17 +450,31 @@ impl Drop for Driver {
     }
 }
 
-/// Whether a unit is among the plugged-in `serials`: the open one (`open`, its serial) by
-/// that serial, else the one `sel` names. An index counts every unit plugged in, in use
-/// elsewhere or not (an open skips those in use), so with another unit present it would
-/// not notice the open one going away; the serial does.
-fn unit_present(serials: &[String], sel: &DeviceSel, open: Option<&str>) -> bool {
-    let serial = match (open, sel) {
-        (Some(s), _) => s,
-        (None, DeviceSel::Serial(s)) => s.as_str(),
-        (None, DeviceSel::Index(n)) => return serials.len() > *n,
-    };
-    serials.iter().any(|p| p.eq_ignore_ascii_case(serial))
+/// What to ask `dt295 serve` for a channel: its frequency (and TS), and its ServiceID.
+fn want(ch: &Channel) -> Want {
+    Want {
+        name: ch.name.clone(),
+        tuning: match ch.sys {
+            System::Terrestrial => Tuning::Terrestrial { hz: ch.freq_hz },
+            System::Satellite => Tuning::Satellite {
+                hz: ch.freq_hz,
+                tsid: ch.tsid,
+            },
+        },
+        sid: ch.sid,
+    }
+}
+
+/// The `(space, channel)` of the first enabled service in a parsed `.ch2` for which
+/// `is_terrestrial` holds (reading and parsing are shared in `dt295::ch2`).
+fn first_terrestrial_ch2_channel(
+    services: &[dt295::ch2::Service],
+    is_terrestrial: impl Fn(u32, u32) -> bool,
+) -> Option<(u32, u32)> {
+    services
+        .iter()
+        .find(|s| s.enabled && is_terrestrial(s.space, s.channel))
+        .map(|s| (s.space, s.channel))
 }
 
 /// For UHF 13-62ch (index `n - 13`), the `(space, channel)` of the first channel to tune
@@ -1201,56 +496,6 @@ fn uhf_channels(spaces: &[Space]) -> Vec<Option<(u32, u32)>> {
         .collect()
 }
 
-/// The `(space, channel)` of the first enabled service in a parsed `.ch2` for which
-/// `is_terrestrial` holds (reading and parsing are shared in `dt295::ch2`).
-fn first_terrestrial_ch2_channel(
-    services: &[dt295::ch2::Service],
-    is_terrestrial: impl Fn(u32, u32) -> bool,
-) -> Option<(u32, u32)> {
-    services
-        .iter()
-        .find(|s| s.enabled && is_terrestrial(s.space, s.channel))
-        .map(|s| (s.space, s.channel))
-}
-
-/// The per-tune diagnostic line, in a fixed format (log analysis greps it). `timing` = stop, tune, start, total.
-fn set_channel_line(
-    freq_hz: u32,
-    locked: bool,
-    cn_db: f32,
-    cn_raw: u32,
-    timing: [Duration; 4],
-) -> String {
-    let [stop, tune, start, total] = timing.map(|d| d.as_millis());
-    format!(
-        "SetChannel {:.3} MHz: {} cn={cn_db:.1}dB (raw {cn_raw}) | timing ms: \
-         stop={stop} tune={tune} start={start} total={total}",
-        f64::from(freq_hz) / 1e6,
-        if locked { "LOCK" } else { "nolock" },
-    )
-}
-
-/// The idle keeper's loop: once a second, unless the device is busy.
-fn idle_keeper(core: &Mutex<Core>, stop: &mpsc::Receiver<()>) {
-    let mut ticks = 0u32;
-    while let Err(RecvTimeoutError::Timeout) = stop.recv_timeout(Duration::from_secs(1)) {
-        let mut core = match core.try_lock() {
-            Ok(g) => g,
-            Err(TryLockError::Poisoned(p)) => p.into_inner(),
-            Err(TryLockError::WouldBlock) => continue,
-        };
-        core.idle_tick();
-        core.watch_tick();
-        ticks = ticks.wrapping_add(1);
-        if ticks.is_multiple_of(3) {
-            // A new link key soon after the first stream, in case the host is killed
-            // (only writes when something changed). Held under the device lock, so it
-            // never lands inside a timing-sensitive bring-up.
-            core.save_state();
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1260,33 +505,12 @@ mod tests {
         let paths =
             ModulePaths::from_module_path(OsStr::new(r"C:\nonexistent-dt295\BonDriver_DT295.dll"));
         let mut cfg = Config::from_ini(&profile::parse(ini).unwrap(), &paths);
-        cfg.state_file = None;
+        cfg.ch2_file = None;
         Driver::with_config(cfg, None)
     }
 
     fn utf16z(s: &str) -> Vec<u16> {
         s.encode_utf16().chain([0]).collect()
-    }
-
-    #[test]
-    fn set_channel_log_line() {
-        let ms = Duration::from_millis;
-        assert_eq!(
-            set_channel_line(
-                557_142_857,
-                true,
-                28.46,
-                1234,
-                [ms(1), ms(2003), ms(1500), ms(3504)]
-            ),
-            "SetChannel 557.143 MHz: LOCK cn=28.5dB (raw 1234) | timing ms: \
-             stop=1 tune=2003 start=1500 total=3504"
-        );
-        assert_eq!(
-            set_channel_line(1_318_000_000, false, -1.0, 0, [ms(0); 4]),
-            "SetChannel 1318.000 MHz: nolock cn=-1.0dB (raw 0) | timing ms: \
-             stop=0 tune=0 start=0 total=0"
-        );
     }
 
     #[test]
@@ -1312,7 +536,7 @@ mod tests {
         );
         // nothing terrestrial -> none
         assert_eq!(first_terrestrial_ch2_channel(&services, |_, _| false), None);
-        // a disabled terrestrial line (…,0) is skipped; the next enabled one wins
+        // a disabled terrestrial line (...,0) is skipped; the next enabled one wins
         let text2 = dt295::ch2::parse("A,0,14,1,1,1,1,1,0\r\nB,0,15,1,1,1,1,1,1\r\n");
         assert_eq!(
             first_terrestrial_ch2_channel(&text2, |_, _| true),
@@ -1341,6 +565,39 @@ mod tests {
     }
 
     #[test]
+    fn what_a_channel_asks_for() {
+        let d = driver("[BS]\nBS01/TS0=1049480,0x4010,151\nBS03/TS1=1087840,0x4631\n");
+        let w = |space: usize, ch: usize| want(&d.spaces[space].channels[ch]);
+        assert_eq!(
+            w(0, 14),
+            Want {
+                name: "27ch".into(),
+                tuning: Tuning::Terrestrial { hz: 557_142_857 },
+                sid: None
+            }
+        );
+        assert_eq!(
+            w(2, 0),
+            Want {
+                name: "BS01/TS0".into(),
+                tuning: Tuning::Satellite {
+                    hz: 1_049_480_000,
+                    tsid: 0x4010
+                },
+                sid: Some(151)
+            }
+        );
+        assert_eq!(w(2, 1).sid, None, "every service of the TS");
+        assert_eq!(
+            w(2, 1).tuning,
+            Tuning::Satellite {
+                hz: 1_087_840_000,
+                tsid: 0x4631
+            }
+        );
+    }
+
+    #[test]
     fn closed_tuner_state() {
         let d = driver("");
         assert!(!d.is_tuner_opening());
@@ -1349,29 +606,12 @@ mod tests {
             (NO_SELECTION, NO_SELECTION)
         );
         assert_eq!(d.signal_level(), 0.0);
-        // Not open: no tune (and no device access).
+        // Not open: no tune (and no daemon asked).
         assert!(!d.set_channel(0, 14));
         assert!(!d.set_channel(9, 0));
         assert!(!d.set_channel_byte(27));
         d.close_tuner();
         assert_eq!(d.cur_space(), NO_SELECTION);
-    }
-
-    #[test]
-    fn presence_of_the_unit() {
-        let plugged = |s: &[&str]| s.iter().map(|x| x.to_string()).collect::<Vec<_>>();
-        let index0 = DeviceSel::Index(0);
-        // Our unit (B) went away while another one (A, in use elsewhere) stays: by the
-        // index, one unit is still there; by the serial of the open unit, ours is gone.
-        assert!(unit_present(&plugged(&["A"]), &index0, None));
-        assert!(!unit_present(&plugged(&["A"]), &index0, Some("B")));
-        assert!(unit_present(&plugged(&["A", "b"]), &index0, Some("B")));
-        // Not open (a re-open): the configured unit.
-        assert!(!unit_present(&plugged(&[]), &index0, None));
-        assert!(!unit_present(&plugged(&["A"]), &DeviceSel::Index(1), None));
-        let by_serial = DeviceSel::Serial("CD23456789".into());
-        assert!(unit_present(&plugged(&["cd23456789"]), &by_serial, None));
-        assert!(!unit_present(&plugged(&["A"]), &by_serial, None));
     }
 
     #[test]

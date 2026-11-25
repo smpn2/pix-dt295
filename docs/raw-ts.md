@@ -3,6 +3,7 @@
 スクランブルされたままの TS をそのまま配信し、B-CAS の解除をホスト側に任せる経路の、内部のまとめ。
 解除先は、Windows (TVTest) では CAS プラグイン、Linux (mirakc) では録画のパイプラインに置いた外部ツール (libarib25 の `b25` など)。
 使い方は、Windows が [usage.md](usage.md) の "`BonDriver_DT295.ini`" セクション (ini の `RawTS`)、Linux が同じく "`dt295 serve`" の "raw-TS モード" セクション (`/etc/dt295.conf` の `raw-ts`)。
+どちらも個体を扱うのは `dt295 serve` で、Windows では BonDriver が起動したものが、ini の `RawTS` の要求 (`mode=raw-ts`) で個体を開く。
 System1 (視聴) の経路は [development.md](development.md)、デバイスの仕様は [device.md](device.md)。
 
 ## 概要
@@ -21,7 +22,7 @@ System1 (視聴) の経路は [development.md](development.md)、デバイスの
 | ファームウェア | 純正の `Firmware` / `TrcFirmware` | 要らない (ホストが cold から立ち上げる) |
 | ベンダーコード | 動く (純正ファーム) | 一切動かない (レジデント, 補助コア, 純正ファーム不使用) |
 | C/N | worker が毎秒読む実値 | worker が毎秒 ホスト面 I2C で読む実値 (System1 と約 1 dB 以内) |
-| 最初の選局 | 速い | cold は立ち上げで遅い (Windows は open で prime, Linux はデーモンが開いたまま保持) |
+| 最初の選局 | 速い | cold は立ち上げで遅い (Windows は open で prime, デーモンが開いている間は retune のみ) |
 | B-CAS カードの抜き挿しからの復帰 | ドライバーの `CardWatch` | ホスト側の解除ツール任せ (カードがデバイス外のため) |
 
 ## 構成
@@ -33,7 +34,8 @@ raw-TS 経路のために、ハードウェアの土台を `dt295-core` に切�
 | `src/dt295-core` | lib | ハードウェアの土台。レジスターとコマンドのプロトコル, I2C, フロントエンド (選局, ロック待ち, C/N), チャンネル表, ファームウェアの転送, 共有する型 (`System` / `Status` / `TsSink`) |
 | `src/dt295-rawfw` | lib | 自前コードのみの raw-TS 経路。cold stream の worker, FR monitor のホスト側, ホスト面の demod I2C。`dt295-core` の上に乗る |
 | `src/dt295` | lib | System1 の経路とアプリの土台。`dt295-core` と `dt295-rawfw` の公開 API を re-export する |
-| `src/dt295-bondriver` | cdylib | `BonDriver_DT295.dll`。raw-TS 経路の呼び出しは `driver.rs` (選局, ストリーム, idle keeper) |
+| `src/dt295-cli` | bin | `dt295 serve` が raw-TS 経路を呼ぶ (`serve/unit.rs` の `serve_raw`, 開始と最初の TS の待ちは `rawts.rs`) |
+| `src/dt295-bondriver` | cdylib | `BonDriver_DT295.dll`。`dt295 serve` に `mode=raw-ts` で選局を頼み、open で prime する (`driver.rs`) |
 
 ファームウェアの `.bin` はコミットしない ([development.md](development.md) の "方針" セクション)。
 
@@ -41,30 +43,31 @@ raw-TS 経路のために、ハードウェアの土台を `dt295-core` に切�
 
 ### モードの選択
 
-ini の `RawTS=1` が `Config::raw_ts` に入ると、`driver.rs` の `RawMode` (マーカー) ができ、選局は raw-TS (cold, 自前コードのみ) 経路へ回る。
-最初の選局でチップを立ち上げ (`cold_arm` の `full`)、以降のチャンネル変更は board を立て直さず retune + 取り込み再 arm だけ (立ち上げ済みかはチップ上の monitor を読んで判断する `cold_monitor_present`)。
+ini の `RawTS=1` で、BonDriver は `dt295 serve` への要求に `mode=raw-ts` を付ける。
+`dt295 serve` は個体を開いたときの要求のモードで個体のスレッドを動かし、raw-TS なら選局は `serve_raw` (cold, 自前コードのみ) 経路へ回る。
+最初の選局でチップを立ち上げ (`full`)、以降のチャンネル変更は board を立て直さず retune + 取り込み再 arm だけ (立ち上げ済みかはチップ上の monitor を読んで判断する `cold_monitor_installed`)。
 
-BonDriver の経路はすべてホスト側で、cold の立ち上げはホストの 0xBC 書き込みとホスト面の I2C だけで通す。
+経路はすべてホスト側で、cold の立ち上げはホストの 0xBC 書き込みとホスト面の I2C だけで通す。
 
-### ストリームの開始 (`SetChannel`)
+### ストリームの開始
 
-`set_channel_raw` は cold の自前コード経路 `set_channel_cold` を呼ぶ。流れ:
+`dt295 serve` の `serve_raw` が `rawts::start` を呼ぶ。流れ:
 
 1. 前の worker を止める。
-   raw-TS 経路はデバイスが TS の全サービスを出し、サービスの選択とデスクランブルは TVTest がするので、行ごとの `ServiceID` は使わない。
-2. チップに自前の monitor が載っているかを読んで、立ち上げ済みか判断する (`cold_monitor_present`)。cold なら最初の選局で全部立ち上げ、立ち上げ済みなら retune と取り込み再 arm だけで速い。
-   フラグではなくチップを読むので、worker の再起動や差し直し無しの再オープンをまたいでも正しく分かる (2 度目の立ち上げは fault するので、載っている monitor を読んで避ける)。
-3. 新しい周波数で worker を起こし、FIFO に TS が届くのを待つ (`start_cold_and_wait`)。
-4. TS が流れたら前回チャンネルを状態ファイルに残す。流れなければ worker を止める。
+   raw-TS 経路はデバイスが TS の全サービスを出し、サービスの選択とデスクランブルは TVTest (か録画のパイプライン) がするので、要求の `sid` は使わない。
+2. チップに自前の monitor が載っているかを読んで、立ち上げ済みか判断する (`cold_monitor_installed`)。cold なら最初の選局で全部立ち上げ、立ち上げ済みなら retune と取り込み再 arm だけで速い。
+   フラグではなくチップを読むので、worker の再起動や差し直し無しの再オープン (別のプロセスからも) をまたいでも正しく分かる (2 度目の立ち上げは fault するので、載っている monitor を読んで避ける)。
+3. 新しい周波数で worker を起こし、TS が届くのを待つ (`rawts::wait_first_ts`)。
+4. TS が流れたらクライアントに `ok` を返す。流れなければ worker を止め、理由 (`no lock` など) を返す。
 
-成否は worker を持っているデバイスへ触らず、FIFO に TS が届いたかで判断する (下の "worker と FIFO" セクション)。
+成否は worker を持っているデバイスへ触らず、TS が届いたかで判断する (下の "worker とキュー" セクション)。
 
-### worker と FIFO
+### worker とキュー
 
 ストリーム中にデバイスと I/O するのは worker のみ、というのは System1 と同じ。
-`Device::stream_start_cold` が worker を立て、worker がデバイスを所有して capture の TS を FIFO (`TsFifo`) へ積む。
-ホスト (`GetTsStream`) は FIFO から lock-free に読むだけで、停止のときだけ worker を止める。
-読み手が遅れて FIFO があふれたら、古いバイトを捨てて数える ([fifo.rs](../src/dt295-bondriver/src/fifo.rs))。
+`Device::stream_start_cold` が worker を立て、worker がデバイスを所有して capture の TS を `dt295 serve` のキューへ積み、書き込みのスレッドがソケットへ書く。
+BonDriver は受け取った TS を FIFO (`TsFifo`) に積み、`GetTsStream` は FIFO から読むだけ。
+読み手が遅れてキューや FIFO があふれたら、捨てて数える ([fifo.rs](../src/dt295-bondriver/src/fifo.rs))。
 
 ### 立ち上げと取り込み
 
@@ -104,8 +107,8 @@ ring が満ちる間隔 (約 0.85 秒) 以上はその場で WARN として出�
 
 cold の初回 `SetChannel` は bootstrap で数秒かかり (地デジで約 2.5 秒)、その間 TS が出ない。
 TVTest の viewer は初回チャンネルを描画し始められず黒いままになる (チャンネルを変えると直る)。
-そこで `OpenTuner` で前もって datapath を bootstrap しておく (`prime_raw`)。
-prime 先は前回見ていたチャンネル (状態ファイルの `rawchannel` 行)、無ければ TVTest のスキャン (`.ch2`) の最初の地デジ局。
+そこで BonDriver は `OpenTuner` で前もって datapath を bootstrap しておく (`prime_raw`)。
+TVTest のスキャン (`.ch2`) の最初の地デジ局を `dt295 serve` に 1 度要求し、ストリームが始まったら止める (スキャンが無ければ何もしない)。
 これで初回 `SetChannel` は速い retune になり、初回チャンネルがそのまま映る。
 全体でかかる時間は変わらず、待ちが初回 `SetChannel` から open へ移るだけ。
 cold の立ち上げは 1 プラグに 1 回で、prime で monitor が載った後は、選局のたびにチップを読んで立ち上げ済みと分かるので、立ち上げを繰り返さない。
@@ -119,42 +122,42 @@ cold の立ち上げは、フロントエンドの初期化 (約 1 秒) と選�
 
 - 最初のチューニングは cold の個体が要る。
   cold からの立ち上げはホストの 0xBC 書き込みとホスト面の I2C だけで通す (ベンダーのコードは動かない)。
-- そのあとは、TVTest を閉じて開き直すだけなら差し直しは要らない。
+- そのあとは、TVTest を閉じて開き直すだけなら差し直しは要らない (その間に `dt295 serve` が終了して起動し直しても同じ)。
   monitor はチップに残るので、開き直してもチップを読めば立ち上げ済みと分かり、最初の選局は速い retune になる。
 - USB を物理的に差し直すとチップが cold に戻る (RAM が消え、monitor も消える) ので、次の選局で改めて立ち上げる。
   差し直しは物理的な抜き挿し 1 回につき 1 度だけ。
 
-### 止まったときの検出 (idle keeper)
+### 止まったときの検出
 
 worker は halt した状態でも fault しないので、TS が止まっても自分では気づけない。
-idle keeper が raw-TS 用に見張る:
+`dt295 serve` のストリームのループが raw-TS 用に見張る:
 
 - 最初の TS は最大 `RAW_FIRST_TS` (30 秒) 待つ。
   cold の bootstrap とロック待ち (衛星で最大約 8 秒) より短くすると、その途中で止めてしまい、チューニング前の EP の読み出しキューを壊してチューニングが失敗する。
 - 流れ始めた後、`RAW_STALL` (8 秒) の間 1 バイトも届かなければ、データパスが止まったとみなして同じチャンネルを選局し直す (`raw_stall_due`)。
-  FIFO の受信バイト数 (`TsFifo::received`) が唯一の生存信号。
-- worker が自分で終わっていたら (unplug など) 片付けて、デバイスが抜かれていれば閉じて、戻ってきたら開き直す。
+  worker が届けたバイト数が唯一の生存信号。
+- worker が自分で終わっていたら (unplug など) 片付けて、デバイスが抜かれていればストリームを終えて閉じ、戻ってきたら開き直す (BonDriver は同じチャンネルを要求し直す)。
 
 ### C/N
 
 worker はストリーム中に約 1 秒ごとに、復調の C/N をホスト面の I2C で読み (`cold_cn` が `fe1::read_cn` を呼ぶ)、デバイスの `Live` に publish する。
-`GetSignalLevel` はその実値を返す (`signal_level`)。
-3 秒以内のサンプルが無ければ (ストリームが止まった後など) 公称値 `RAW_NOMINAL_CN_DB` (30 dB) に戻る。
+ストリームの開始時には、選局でロックしたときに読んだ値もすぐに publish する。
+`dt295 serve` は選局の応答 (`ok cn=...`) と `status` の要求にその実値を返し、BonDriver の `GetSignalLevel` はそれを返す。
+値が無ければ (流れ始める前など) 公称値の 30 dB。
 System1 経路 (ファームウェア経由で読む) と約 1 dB 以内で一致する。
 
 ## Linux (mirakc)
 
-Linux では `dt295 serve` (デーモン) が raw-TS 経路を担う。
-BonDriver と同じ `dt295-core` / `dt295-rawfw` の仕組みで、デーモンのスレッドが個体を cold から立ち上げて capture の TS を FIFO に積み、`dt295 tune` のクライアントへ流す (`serve/unit.rs` の `serve_raw`)。
+Linux でも `dt295 serve` (デーモン) が raw-TS 経路を担い、`dt295 tune` のクライアントへ流す (`serve/unit.rs` の `serve_raw`)。
 
 - 個体ごとに `/etc/dt295.conf` の `raw-ts = true` で有効化する
 - cold の立ち上げは最初の選局で 1 回。
-  デーモンが個体を開いたまま保持するので、以降のチャンネル変更は retune だけ (立ち上げ済みかはチップ上の monitor を読んで判断する。BonDriver と同じ)。
+  デーモンが個体を開いたまま保持するので、以降のチャンネル変更は retune だけ (立ち上げ済みかはチップ上の monitor を読んで判断する)。
   物理的な抜き挿しで cold に戻る
 - B-CAS の解除は mirakc のパイプラインで行う。
   チューナーを `decoded: false` にし、`filters.decode-filter` に外部ツール (libarib25 の `b25 /dev/stdin /dev/stdout` など) を置く。
   解除には PC/SC リーダーの契約済みカードと pcscd が要る
-- 止まったときの検出は BonDriver と同じ `raw_stall_due` (最初の TS は最大 30 秒、流れ始めた後は 8 秒無信号で選局し直す)
+- 止まったときの検出は Windows と同じ `raw_stall_due` (最初の TS は最大 30 秒、流れ始めた後は 8 秒無信号で選局し直す)
 - EPGStation からの録画と、ブラウザでの視聴まで、純正ファームを使わずに通ることを実機で確認している
 
 ## dt295 capture と dt295 logo
