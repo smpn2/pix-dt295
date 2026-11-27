@@ -605,9 +605,9 @@ pub const EP_BYTE_ENABLE: u32 = 0x00fd_814c;
 /// TS record geometry: 192-byte ring records = 188 TS bytes + a 4-byte suffix.
 pub const RECORD_BYTES: u32 = 192;
 pub const TS_BYTES: u32 = 188;
-/// Records forwarded per pump call, bounding on-chip time so the host reads EP
-/// between calls (the resident uses the same ~64/SERVICE batch).
-pub const PUMP_BATCH: u8 = 64;
+/// Maximum FIFO bursts per pump CALL, bounding on-chip time. On Windows a
+/// larger batch lets the pump catch up after delays in control transfers.
+pub const PUMP_BATCH: u8 = if cfg!(windows) { 128 } else { 64 };
 
 /// The largest EP FIFO burst: 512 bytes (a full USB bulk packet, as the resident
 /// uses), far fewer commits than one per TS packet. The tail burst at the ring end
