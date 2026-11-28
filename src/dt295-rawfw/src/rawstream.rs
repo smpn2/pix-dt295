@@ -37,8 +37,10 @@ const RQ_N: usize = cfg_select! {
     _ => 8,
 };
 const RQ_SIZE: usize = 0x10000;
-/// How long to wait for the next EP 0x81 chunk; also paces the pump.
+/// Wait for reads on the synchronous fallback and the non-Windows backend.
 const REAP_TIMEOUT: Duration = Duration::from_millis(1);
+/// How long to idle between non-blocking WinUSB polls, at most.
+const WINUSB_POLL_IDLE: Duration = Duration::from_micros(500);
 
 /// How often the loop pumps the ring to EP 0x81.
 const PUMP_EVERY: Duration = Duration::from_millis(2);
@@ -311,6 +313,14 @@ fn pump_stream(
         Err(why) => info!("raw-TS cold: the stream keeps the normal priority ({why})"),
     }
     let mut queue = io.usb.read_queue(EP_TS, RQ_N, RQ_SIZE).ok();
+    // Windows can round a 1 ms event wait up to a scheduler tick. Leave the read
+    // posted and poll its completion so that this wait cannot pace the pump.
+    let poll_winusb = cfg!(windows) && queue.is_some();
+    let queue_wait = if poll_winusb {
+        Duration::ZERO
+    } else {
+        REAP_TIMEOUT
+    };
     let mut rt = MonitorResident::new(io);
     let mut reframer = ColdReframer::new();
     let mut cc = CcCheck::new();
@@ -319,7 +329,7 @@ fn pump_stream(
     let mut stats = RawCaptureStats::default();
     let start = Instant::now();
     let mut last_cn = Instant::now();
-    let mut last_pump = Instant::now() - Duration::from_millis(10);
+    let mut next_pump = start;
     // When the previous pump started (the intervals are measured start to start).
     let mut pump_started: Option<Instant> = None;
     // The loss report: the totals at the last one, and the longest pump interval since.
@@ -334,11 +344,9 @@ fn pump_stream(
             info!("raw-TS cold: stop requested; ending");
             break;
         }
-        // Keep the FIFO fed, but cap the pump rate: one pump drains up to 32 KiB, so ~2 ms
-        // between pumps (16 MB/s) is well above the ~5 MB/s of a full CS transponder, while
-        // cutting the control-transfer traffic of pumping on every (sub-millisecond) loop
-        // pass. Each interval is timed: one past what the ring holds (~0.85 s) loses TS.
-        if last_pump.elapsed() >= PUMP_EVERY {
+        // On the polled WinUSB path, pace pump starts. If a control transfer already
+        // used the interval, let the next loop pump again after polling the queue.
+        if Instant::now() >= next_pump {
             let now = Instant::now();
             if let Some(prev) = pump_started {
                 let gap = now - prev;
@@ -359,14 +367,16 @@ fn pump_stream(
             }
             pump_started = Some(now);
             let _ = rt.pump();
-            last_pump = Instant::now();
+            let pacing_start = if poll_winusb { now } else { Instant::now() };
+            next_pump = pacing_start + PUMP_EVERY;
         }
+        let mut usb_pending = false;
         match queue.as_mut() {
-            Some(q) => match q.next(REAP_TIMEOUT) {
+            Some(q) => match q.next(queue_wait) {
                 Ok(Some(data)) => {
                     frame_chunk(&mut reframer, &mut cc, sink, data, &mut out, &mut stats)
                 }
-                Ok(None) => {}
+                Ok(None) => usb_pending = true,
                 Err(dt295_usb::Error::Timeout) | Err(dt295_usb::Error::Cancelled) => {}
                 Err(dt295_usb::Error::NoDevice) => {
                     return Err(Error::State(UNPLUGGED.into()));
@@ -413,6 +423,15 @@ fn pump_stream(
             reported = stats;
             window_max_gap = Duration::ZERO;
             last_report = Instant::now();
+        }
+        if poll_winusb && usb_pending {
+            // Idle without waiting on the USB event or sleeping past the pump deadline.
+            let idle = next_pump
+                .saturating_duration_since(Instant::now())
+                .min(WINUSB_POLL_IDLE);
+            if !idle.is_zero() {
+                std::thread::sleep(idle);
+            }
         }
     }
     stats.packets = stats.bytes / TS_PACKET as u64;
