@@ -7,7 +7,9 @@
 //! > tune unit=AB12345678 sat=1318000000 tsid=40f1 sid=101
 //! > tune unit=AB12345678 sat=1318000000 tsid=40f1 sid=929 if-free
 //! > tune ter=557142857 mode=raw-ts client=4242-1 if-free
+//! > tune unit=EF34567890 tuner=2 ter=557142857 client=4242-2 if-free
 //! > status unit=AB12345678
+//! > status unit=EF34567890 tuner=2
 //! < ok unit=AB12345678 cn=33500
 //! < error unit AB12345678 is not connected
 //! < busy unit AB12345678 is streaming
@@ -16,7 +18,8 @@
 //! Frequencies are in Hz, `tsid` in hex, `sid` in decimal or `0x` hex; `tsid` is
 //! optional (default: the frequency's first TS, as with `dt295 capture`), and so is
 //! `sid` (default: every service of the TS). Without `unit` the daemon takes the only
-//! unit connected. `mode` asks for the System1 path (`system1`: the vendor firmware and
+//! unit connected. `tuner` is 1 (the default) or 2, a two-tuner model's second tuner, whose
+//! streams run beside the first one's. `mode` asks for the System1 path (`system1`: the vendor firmware and
 //! the unit's B-CAS card) or the blob-free one (`raw-ts`: the scrambled TS); without it
 //! the unit runs as configured. `if-free` asks for the tuner only if no stream of another
 //! client runs on it (a request without it takes the tuner over); `busy` is the answer
@@ -24,7 +27,7 @@
 //! that its own stream is replaced at once on a channel change.
 //!
 //! The `ok` gives the unit (its USB serial number) and, when known, the C/N (0.001 dB):
-//! of the tune, and of a `status` the stream's latest.
+//! of the tune, and of a `status` the latest of the tuner's stream.
 
 use crate::chan::NO_TSID;
 
@@ -62,6 +65,8 @@ impl Mode {
 pub struct Request {
     /// The USB serial number of the unit; empty = the only unit connected.
     pub unit: String,
+    /// The tuner of the unit: 1, or 2 (a two-tuner model's second).
+    pub tuner: u8,
     pub tuning: Tuning,
     pub sid: Option<u16>,
     /// The path to stream on; `None` = the unit's own.
@@ -69,15 +74,17 @@ pub struct Request {
     /// Who asks (no blanks): a request of the client whose stream runs replaces it, also
     /// with `if_free`.
     pub client: Option<String>,
-    /// Only if the unit is free: never take it over from another client's stream.
+    /// Only if the tuner is free: never take it over from another client's stream.
     pub if_free: bool,
 }
 
-/// A `status` request: the unit's latest C/N.
+/// A `status` request: the latest C/N of a tuner's stream.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StatusRequest {
     /// The USB serial number of the unit; empty = the only unit connected.
     pub unit: String,
+    /// The tuner of the unit: 1, or 2.
+    pub tuner: u8,
 }
 
 /// Any request line.
@@ -104,6 +111,14 @@ impl Asked {
         }
     }
 
+    /// The tuner asked for: 1 or 2.
+    pub fn tuner(&self) -> u8 {
+        match self {
+            Self::Tune(r) => r.tuner,
+            Self::Status(s) => s.tuner,
+        }
+    }
+
     /// The request line, without its newline.
     pub fn to_line(&self) -> String {
         match self {
@@ -119,6 +134,9 @@ impl Request {
         let mut s = "tune".to_owned();
         if !self.unit.is_empty() {
             s.push_str(&format!(" unit={}", self.unit));
+        }
+        if self.tuner != 1 {
+            s.push_str(&format!(" tuner={}", self.tuner));
         }
         match self.tuning {
             Tuning::Terrestrial { hz } => s.push_str(&format!(" ter={hz}")),
@@ -147,6 +165,7 @@ impl Request {
         }
         let (mut unit, mut ter, mut sat, mut tsid, mut sid) = (None, None, None, None, None);
         let (mut mode, mut client) = (None, None);
+        let mut tuner = 1;
         let mut if_free = false;
         for word in words {
             if word == "if-free" {
@@ -158,6 +177,7 @@ impl Request {
                 .ok_or_else(|| format!("{word:?}: expected key=value"))?;
             match key {
                 "unit" if !value.is_empty() => unit = Some(value.to_owned()),
+                "tuner" => tuner = parse_tuner(value)?,
                 "ter" => ter = Some(parse_u32(value)?),
                 "sat" => sat = Some(parse_u32(value)?),
                 "tsid" => tsid = Some(parse_hex_u16(value)?),
@@ -178,6 +198,7 @@ impl Request {
         };
         Ok(Self {
             unit: unit.unwrap_or_default(),
+            tuner,
             tuning,
             sid,
             mode,
@@ -190,11 +211,14 @@ impl Request {
 impl StatusRequest {
     /// The request line, without its newline.
     pub fn to_line(&self) -> String {
-        if self.unit.is_empty() {
-            "status".into()
-        } else {
-            format!("status unit={}", self.unit)
+        let mut s = "status".to_owned();
+        if !self.unit.is_empty() {
+            s.push_str(&format!(" unit={}", self.unit));
         }
+        if self.tuner != 1 {
+            s.push_str(&format!(" tuner={}", self.tuner));
+        }
+        s
     }
 
     pub fn parse(line: &str) -> Result<Self, String> {
@@ -202,15 +226,17 @@ impl StatusRequest {
         if words.next() != Some("status") {
             return Err("expected a status request".into());
         }
-        let mut unit = None;
+        let (mut unit, mut tuner) = (None, 1);
         for word in words {
             match word.split_once('=') {
                 Some(("unit", value)) if !value.is_empty() => unit = Some(value.to_owned()),
+                Some(("tuner", value)) => tuner = parse_tuner(value)?,
                 _ => return Err(format!("{word:?}: unknown")),
             }
         }
         Ok(Self {
             unit: unit.unwrap_or_default(),
+            tuner,
         })
     }
 }
@@ -224,7 +250,7 @@ pub enum Reply {
         unit: Option<String>,
         cn_mdb: Option<i32>,
     },
-    /// An `if-free` request for a unit that streams for another client.
+    /// An `if-free` request for a tuner that streams for another client.
     Busy(String),
     Error(String),
 }
@@ -287,6 +313,15 @@ fn parse_u16(s: &str) -> Result<u16, String> {
     u16::try_from(parse_u64_auto(s)?).map_err(|_| format!("{s:?}: out of range"))
 }
 
+/// A tuner number: 1 or 2.
+fn parse_tuner(s: &str) -> Result<u8, String> {
+    match s {
+        "1" => Ok(1),
+        "2" => Ok(2),
+        _ => Err(format!("tuner {s:?}: expected 1 or 2")),
+    }
+}
+
 /// Hex with or without `0x`.
 fn parse_hex_u16(s: &str) -> Result<u16, String> {
     let hex = s
@@ -303,6 +338,7 @@ mod tests {
     fn tune(unit: &str, tuning: Tuning) -> Request {
         Request {
             unit: unit.into(),
+            tuner: 1,
             tuning,
             sid: None,
             mode: None,
@@ -348,6 +384,12 @@ mod tests {
                 mode: Some(Mode::System1),
                 ..tune("A", Tuning::Terrestrial { hz: 1 })
             },
+            Request {
+                tuner: 2,
+                client: Some("4242-2".into()),
+                if_free: true,
+                ..tune("EF34567890", Tuning::Terrestrial { hz: 557_142_857 })
+            },
         ] {
             assert_eq!(Request::parse(&r.to_line()), Ok(r.clone()));
             assert_eq!(Asked::parse(&r.to_line()), Ok(Asked::Tune(r)));
@@ -378,15 +420,22 @@ mod tests {
             "",
             "without a unit: the only one"
         );
+        assert_eq!(Request::parse("tune ter=1").unwrap().tuner, 1);
+        assert_eq!(Request::parse("tune tuner=2 ter=1").unwrap().tuner, 2);
     }
 
     #[test]
     fn status_round_trip() {
-        for unit in ["AB12345678", ""] {
-            let s = StatusRequest { unit: unit.into() };
+        for (unit, tuner) in [("AB12345678", 1), ("", 1), ("EF34567890", 2), ("", 2)] {
+            let s = StatusRequest {
+                unit: unit.into(),
+                tuner,
+            };
             assert_eq!(Asked::parse(&s.to_line()), Ok(Asked::Status(s)));
         }
         assert_eq!(StatusRequest::parse("status").unwrap().unit, "");
+        assert_eq!(StatusRequest::parse("status").unwrap().tuner, 1);
+        assert!(Asked::parse("status tuner=3").is_err());
         assert!(Asked::parse("status ter=1").is_err());
         assert!(Asked::parse("status unit=").is_err());
     }
@@ -404,6 +453,9 @@ mod tests {
             "tune unit=A ter=1 lnb=on",
             "tune unit=A ter=1 mode=raw",
             "tune unit=A ter=1 client=",
+            "tune unit=A tuner=0 ter=1",
+            "tune unit=A tuner=3 ter=1",
+            "tune unit=A tuner= ter=1",
             "tune unit=A ter",
         ] {
             assert!(Asked::parse(line).is_err(), "{line:?}");

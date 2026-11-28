@@ -1,7 +1,7 @@
 //! `BonDriver_DT295.ini` (next to the DLL, same base name), read under the Win32
 //! profile API's rules ([`dt295::profile`]).
 //!
-//! `[Tuner]`: `DeviceSerial`, `RawTS`, `ChannelFile` ([`dt295::bonini::Tuner`]),
+//! `[Tuner]`: `DeviceSerial`, `TunerNumber`, `RawTS`, `ChannelFile` ([`dt295::bonini::Tuner`]),
 //! `LogFile`, `LogLevel`, `UHF`, `CATV`. `[BS]` / `[CS110]`: one
 //! `name=IF_kHz,TSID[,ServiceID]` line per channel. `[Server]`: `IdleExitSec`,
 //! `StartTimeoutSec` (the `dt295 serve` the DLL starts). The `[Tuner]` keys of the unit
@@ -87,6 +87,8 @@ pub struct Config {
     pub dir: PathBuf,
     /// `[Tuner] DeviceSerial`; `None` = the only unit connected.
     pub serial: Option<String>,
+    /// `[Tuner] TunerNumber`: the tuner of the unit, 1 or 2 (a two-tuner model's second).
+    pub tuner: u8,
     /// `[Tuner] RawTS`: non-zero = the blob-free raw-TS path -- the scrambled TS, for the
     /// PC-side B-CAS (TVTest's CAS plugin) to descramble. Absent / 0 = the System1 path
     /// (the vendor firmware, the device's internal B-CAS reader).
@@ -142,6 +144,7 @@ impl Config {
         Self {
             dir: folder(&paths.dir),
             serial: tuner.serial,
+            tuner: tuner.tuner_number,
             raw_ts: tuner.raw_ts,
             log_file,
             log_level,
@@ -165,6 +168,7 @@ impl Config {
         Settings {
             dir: self.dir.clone(),
             serial: self.serial.clone(),
+            tuner: self.tuner,
             mode: if self.raw_ts {
                 Mode::RawTs
             } else {
@@ -254,6 +258,7 @@ mod tests {
     fn defaults_without_ini() {
         let c = config("");
         assert_eq!(c.serial, None, "the only unit");
+        assert_eq!(c.tuner, 1);
         assert!(!c.raw_ts);
         assert_eq!(c.log_file, None, "no LogFile key = no log file");
         assert_eq!(

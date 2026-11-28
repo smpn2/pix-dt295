@@ -134,6 +134,7 @@ mod reg {
     pub const R8: u8 = 8;
     pub const R9: u8 = 9;
     pub const R10: u8 = 10;
+    pub const R11: u8 = 11;
     pub const R12: u8 = 12;
     pub const R13: u8 = 13; // implicit index base for @(R13, Rj)
 }
@@ -592,7 +593,6 @@ pub fn monitor() -> Monitor {
 /// on a record boundary, and of the 512-byte burst, so no burst is ever cut short at the
 /// ring end; the length register keeps only multiples of 64.
 pub const RING_BASE: u32 = 0x0200_0000; // physical, what the capture DMA writes
-pub const RING_BASE_CPU: u32 = RING_BASE | 0x8000_0000; // the CPU view
 pub const RING_SIZE: u32 = 0x003f_fc00; // 2730 x 1536 (lcm of 192 and 512)
 pub const REG_RING_WRITE: u32 = 0x0190_2028; // hardware write offset
 pub const REG_RING_READ: u32 = 0x0190_202c; // consumer offset (we write it back)
@@ -602,6 +602,57 @@ pub const EP_FIFO_CTRL: u32 = 0x00fd_bd0c; // bit2 = ready; write 4 = commit
 /// the default). The commit writes 8 first, so its store of 4 to [`EP_FIFO_CTRL`] lands in
 /// the low byte only, then puts 0xF back.
 pub const EP_BYTE_ENABLE: u32 = 0x00fd_814c;
+/// One TS pump: which capture ring it drains and which bulk IN endpoint it feeds.
+///
+/// The chip has a second TS capture (input 0x00D21000, engine 0x00D22000) besides the one at
+/// 0x0190xxxx; on a PIX-DT195W it takes the demod's output B. [`PUMP_A`] drains the first into
+/// EP 0x81, [`PUMP_B`] the second into EP 0x86. An endpoint's FIFO status is at
+/// 0x00FDBD0C + 8 x (n - 1) and its data port at 0x00FDBD80 + 4 x n.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Pump {
+    /// Where the routine is uploaded (boot0 RAM, inside the 0x800 bytes at [`BODY_ADDRESS`]).
+    pub address: u32,
+    /// The ring's physical base (what the capture DMA writes; the CPU reads it | 0x80000000).
+    pub ring_base: u32,
+    /// The hardware's write offset register.
+    pub ring_write: u32,
+    /// The consumer offset register (the pump writes it back).
+    pub ring_read: u32,
+    /// The endpoint's 32-bit FIFO data port.
+    pub fifo: u32,
+    /// The endpoint's FIFO status (bit2 = ready; writing 4 commits).
+    pub fifo_ctrl: u32,
+    /// Which capture this is (0 the first, 1 the second): its slot in the aux core's
+    /// prefetch ([`AUX_STAGE`] and the mailbox words).
+    pub index: usize,
+}
+
+/// The first capture (0x0190xxxx) into EP 0x81.
+pub const PUMP_A: Pump = Pump {
+    address: PUMP_ADDRESS,
+    ring_base: RING_BASE,
+    ring_write: REG_RING_WRITE,
+    ring_read: REG_RING_READ,
+    fifo: EP_FIFO,
+    fifo_ctrl: EP_FIFO_CTRL,
+    index: 0,
+};
+
+/// The second capture (0x00D2xxxx) into EP 0x86. Its ring is the 4 MiB after the first one's
+/// (below 0x02800000, which the chip's ROM uses).
+pub const PUMP_B: Pump = Pump {
+    address: PUMP_B_ADDRESS,
+    ring_base: RING_B_BASE,
+    ring_write: 0x00d2_2028,
+    ring_read: 0x00d2_202c,
+    fifo: 0x00fd_bd98,
+    fifo_ctrl: 0x00fd_bd34,
+    index: 1,
+};
+
+/// The second capture's ring (physical). Same [`RING_SIZE`] as the first.
+pub const RING_B_BASE: u32 = 0x0240_0000;
+
 /// TS record geometry: 192-byte ring records = 188 TS bytes + a 4-byte suffix.
 pub const RECORD_BYTES: u32 = 192;
 pub const TS_BYTES: u32 = 188;
@@ -615,12 +666,14 @@ pub const PUMP_BATCH: u8 = 64;
 pub const FIFO_BLOCK_BYTES: u32 = 512;
 
 // The ring wraps on a record and after a whole burst, the length register holds it (multiples
-// of 64), and it stays within the 4 MiB at 0x02000000.
+// of 64), and each ring stays within its 4 MiB (the second ends below 0x02800000).
 const _: () = assert!(
     RING_SIZE.is_multiple_of(RECORD_BYTES)
         && RING_SIZE.is_multiple_of(FIFO_BLOCK_BYTES)
         && RING_SIZE.is_multiple_of(64)
         && RING_SIZE <= 0x0040_0000
+        && RING_B_BASE >= RING_BASE + 0x0040_0000
+        && RING_B_BASE + 0x0040_0000 <= 0x0280_0000
 );
 
 /// How long the pump spins for the EP FIFO to become ready before giving up for this
@@ -630,8 +683,13 @@ const _: () = assert!(
 /// stops it.
 pub const FIFO_POLL: u32 = 0x0001_0000;
 
-/// Our own TS pump: forward up to [`PUMP_BATCH`] FIFO bursts of the capture ring to
-/// EP 0x81, replacing the resident's SERVICE-driven ring->EP copy. It streams the
+/// Our own TS pump for [`PUMP_A`] (see [`ts_pump_for`]).
+pub fn ts_pump() -> Vec<u8> {
+    ts_pump_for(&PUMP_A)
+}
+
+/// Our own TS pump: forward up to [`PUMP_BATCH`] FIFO bursts of a capture ring to its
+/// endpoint, replacing the resident's SERVICE-driven ring->EP copy. It streams the
 /// ring contiguously -- 192-byte records with their 4-byte suffix -- in bursts of up
 /// to 512 bytes (the host strips the suffix with 192-byte framing), guard-committing
 /// each. A burst is clamped so it never crosses the ring-end: the tail burst is
@@ -639,21 +697,21 @@ pub const FIFO_POLL: u32 = 0x0001_0000;
 /// delivered byte stream clean across the wrap. It stops when less than one burst is
 /// available or the FIFO is not ready. Entered by a monitor CALL; uses only
 /// caller-saved r0..r7 and makes no nested calls, so no stack frame. Returns r4 = 0.
-pub fn ts_pump() -> Vec<u8> {
+pub fn ts_pump_for(p: &Pump) -> Vec<u8> {
     use reg::*;
-    let mut a = Asm::new(PUMP_ADDRESS);
+    let mut a = Asm::new(p.address);
 
     a.ldi8(PUMP_BATCH, R7); // r7 = burst budget
-    a.ldi32(RING_BASE_CPU, R6); // r6 = ring base (constant across the call)
+    a.ldi32(p.ring_base | 0x8000_0000, R6); // r6 = ring base, CPU view (constant across the call)
 
     a.label("loop");
     a.cmp_i(0, R7);
     a.beq("done");
 
     // r2 = read offset, r3 = write offset.
-    a.ldi32(REG_RING_READ, R1);
+    a.ldi32(p.ring_read, R1);
     a.ld(R1, R2);
-    a.ldi32(REG_RING_WRITE, R1);
+    a.ldi32(p.ring_write, R1);
     a.ld(R1, R3);
 
     // available = (W - R) mod ring size, into r0. The ring size is past ldi20's 20 bits.
@@ -685,7 +743,7 @@ pub fn ts_pump() -> Vec<u8> {
     // delivered only a fraction of the rate and overflowed the ring (dropping the sparse
     // SI / PCR). The host's async EP reads drain the FIFO at USB speed while this polls; if
     // the host has stopped reading, the budget runs out and the pump returns.
-    a.ldi32(EP_FIFO_CTRL, R1); // r1 = ctrl addr (kept through the poll)
+    a.ldi32(p.fifo_ctrl, R1); // r1 = ctrl addr (kept through the poll)
     a.ldi20(FIFO_POLL, R3); // r3 = poll budget (free until the copy reuses r3)
     a.label("fifo_wait");
     a.ld(R1, R0);
@@ -706,7 +764,7 @@ pub fn ts_pump() -> Vec<u8> {
     a.addn(R2, R1); // src = base + R
     a.mov(R1, R3);
     a.addn(R5, R3); // end = src + burst
-    a.ldi32(EP_FIFO, R4);
+    a.ldi32(p.fifo, R4);
     a.label("copyw");
     a.ld(R1, R0);
     a.st(R0, R4); // FIFO <- word
@@ -718,7 +776,7 @@ pub fn ts_pump() -> Vec<u8> {
     a.ldi32(EP_BYTE_ENABLE, R1);
     a.ldi8(8, R0);
     a.st(R0, R1);
-    a.ldi32(EP_FIFO_CTRL, R3);
+    a.ldi32(p.fifo_ctrl, R3);
     a.ldi8(4, R0);
     a.st(R0, R3);
     a.ldi8(0xf, R0);
@@ -731,7 +789,7 @@ pub fn ts_pump() -> Vec<u8> {
     a.bne("nowrap");
     a.ldi8(0, R2);
     a.label("nowrap");
-    a.ldi32(REG_RING_READ, R1);
+    a.ldi32(p.ring_read, R1);
     a.st(R2, R1);
 
     a.ldi8(1, R1);
@@ -745,8 +803,397 @@ pub fn ts_pump() -> Vec<u8> {
     a.finish()
 }
 
+// ---- The aux core's prefetch ----
+//
+// The pump's time goes about half to its SDRAM reads (~175 ns a word; the FIFO stores take
+// ~230 ns) and the chip's CPU runs both captures' pumps, so the two carry about 8.6 MB/s of
+// TS in all. The chip has a second FR core (unit 0x017's; the stock firmware runs its USB
+// stack there) that this stub leaves idle. It cannot feed the FIFOs itself: it reaches the
+// USB block only while 0x00F1010C bit 3 hands the block over, and then the main core loses it
+// (its EP0 fails). It can read SDRAM, though, so it copies each ring into its own RAM, where
+// the main core reads ~4x faster, and the main core's pump only moves that to the FIFO.
+
+/// The aux core's unit registers (main view): +0 resets (bit 17 the core), +4 clocks.
+pub const AUX_UNIT: u32 = 0x0170_0000;
+/// Its reset vector (main view; write-only).
+pub const AUX_VECTOR: u32 = 0x017f_fffc;
+/// The main core's view of an address in the aux core's 16 KiB RAM (aux view 0x000A0000).
+pub const fn aux_main_view(aux: u32) -> u32 {
+    AUX_UNIT + aux
+}
+/// Where the prefetch is loaded and entered (aux view).
+pub const AUX_ENTRY: u32 = 0x000a_2d00;
+/// Each capture's staging: [`AUX_SLOTS`] bursts of [`FIFO_BLOCK_BYTES`] (aux view).
+pub const AUX_STAGE: [u32; 2] = [0x000a_0000, 0x000a_1000];
+pub const AUX_SLOTS: u32 = 8;
+// The mailbox (aux view). A main-core store into this RAM rewrites the words around it with
+// what it read a moment before, so words two writers share would lose updates: each word sits
+// in its own 64 bytes.
+/// The prefetch's signature (it writes it on entry): which image runs.
+pub const AUX_SIG: u32 = 0x000a_3c00;
+/// A counter the prefetch bumps every pass: it runs.
+pub const AUX_ALIVE: u32 = 0x000a_3c40;
+/// Per capture, the host's request: 0 = leave the ring alone, else a generation to take it.
+pub const AUX_RUN: [u32; 2] = [0x000a_3c80, 0x000a_3cc0];
+/// Per capture, the request the prefetch has taken (it copies only while this is not 0).
+pub const AUX_ACK: [u32; 2] = [0x000a_3d00, 0x000a_3d40];
+/// Per capture, bursts staged (the prefetch's) and bursts sent (the main pump's).
+pub const AUX_HEAD: [u32; 2] = [0x000a_3d80, 0x000a_3dc0];
+pub const AUX_TAIL: [u32; 2] = [0x000a_3e00, 0x000a_3e40];
+/// How long the prefetch pauses (register-only loop passes) when it has nothing to copy: a
+/// tight loop on the shared bus starves the main core's reads of this RAM.
+const AUX_IDLE_PAUSE: u32 = 0x200;
+
+/// The aux core's prefetch, and its signature (a hash of the image, which it writes to
+/// [`AUX_SIG`] on entry). For each capture whose request ([`AUX_RUN`]) it has taken: while
+/// a staging slot is free and the ring holds a burst, it copies the burst into the slot and
+/// advances the capture's read offset. A new request empties the staging; 0 stops the
+/// copying. It never touches USB.
+pub fn aux_prefetch() -> (Vec<u8>, u32) {
+    let sig = {
+        let image = aux_prefetch_with(0);
+        image.iter().fold(0x811c_9dc5u32, |h, &b| {
+            (h ^ u32::from(b)).wrapping_mul(0x0100_0193)
+        }) | 1
+    };
+    (aux_prefetch_with(sig), sig)
+}
+
+fn aux_prefetch_with(sig: u32) -> Vec<u8> {
+    use reg::*;
+    let mut a = Asm::new(AUX_ENTRY);
+    a.ldi32(sig, R0);
+    a.ldi32(AUX_SIG, R1);
+    a.st(R0, R1);
+    a.ldi32(AUX_ALIVE, R8);
+    a.label("pass");
+    a.ld(R8, R0);
+    a.addn_i(1, R0);
+    a.st(R0, R8);
+    a.ldi8(0, R12); // r12 = did anything this pass
+    for (c, p) in [PUMP_A, PUMP_B].iter().enumerate() {
+        let l = |n: &str| format!("{n}{c}");
+        // A new request: take it (emptying the staging first when it is one to run).
+        a.ldi32(AUX_RUN[c], R1);
+        a.ld(R1, R2); // r2 = run
+        a.ldi32(AUX_ACK[c], R1);
+        a.ld(R1, R3); // r3 = ack
+        a.cmp(R3, R2);
+        a.beq(&l("taken"));
+        a.cmp_i(0, R2);
+        a.beq(&l("answer"));
+        a.ldi8(0, R0);
+        a.ldi32(AUX_HEAD[c], R4);
+        a.st(R0, R4);
+        a.label(&l("answer"));
+        a.st(R2, R1); // ack = run
+        a.ldi8(1, R12);
+        a.bra(&l("next"));
+        a.label(&l("taken"));
+        a.cmp_i(0, R2);
+        a.beq(&l("next"));
+        // A free slot? head - tail < AUX_SLOTS.
+        a.ldi32(AUX_HEAD[c], R1);
+        a.ld(R1, R2); // r2 = head
+        a.ldi32(AUX_TAIL[c], R1);
+        a.ld(R1, R3); // r3 = tail
+        a.mov(R2, R0);
+        a.subn(R3, R0);
+        a.ldi8(AUX_SLOTS as u8, R1);
+        a.cmp(R1, R0);
+        a.bc(&l("room"));
+        a.bra(&l("next"));
+        a.label(&l("room"));
+        // A whole burst in the ring? (W - R) mod size >= 512.
+        a.ldi32(p.ring_read, R1);
+        a.ld(R1, R4); // r4 = R
+        a.ldi32(p.ring_write, R1);
+        a.ld(R1, R5); // r5 = W
+        a.mov(R5, R0);
+        a.subn(R4, R0);
+        a.ldi32(RING_SIZE - 1, R1);
+        a.cmp(R1, R0);
+        a.bls(&l("avail"));
+        a.ldi32(RING_SIZE, R1);
+        a.addn(R1, R0);
+        a.label(&l("avail"));
+        a.ldi20(FIFO_BLOCK_BYTES, R1);
+        a.cmp(R1, R0);
+        a.bc(&l("next"));
+        // Copy ring[R .. R + 512] into slot head % AUX_SLOTS. The ring size is a multiple of
+        // 512, so a burst never straddles its end.
+        a.ldi32(p.ring_base | 0x8000_0000, R1);
+        a.addn(R4, R1); // r1 = source
+        a.mov(R2, R5);
+        a.ldi8((AUX_SLOTS - 1) as u8, R0);
+        a.and(R0, R5);
+        a.lsl_i(9, R5);
+        a.ldi32(AUX_STAGE[c], R0);
+        a.addn(R0, R5); // r5 = slot
+        a.mov(R1, R6);
+        a.ldi20(FIFO_BLOCK_BYTES, R0);
+        a.addn(R0, R6); // r6 = source end
+        a.label(&l("copy"));
+        a.ld(R1, R0);
+        a.st(R0, R5);
+        a.addn_i(4, R1);
+        a.addn_i(4, R5);
+        a.cmp(R6, R1);
+        a.bne(&l("copy"));
+        // R += 512 (wrapping), back to the capture; then the slot is the main pump's.
+        a.ldi20(FIFO_BLOCK_BYTES, R0);
+        a.addn(R0, R4);
+        a.ldi32(RING_SIZE, R0);
+        a.cmp(R0, R4);
+        a.bne(&l("nowrap"));
+        a.ldi8(0, R4);
+        a.label(&l("nowrap"));
+        a.ldi32(p.ring_read, R1);
+        a.st(R4, R1);
+        a.addn_i(1, R2);
+        a.ldi32(AUX_HEAD[c], R1);
+        a.st(R2, R1);
+        a.ldi8(1, R12);
+        a.label(&l("next"));
+    }
+    a.cmp_i(0, R12);
+    a.bne("again");
+    a.ldi20(AUX_IDLE_PAUSE, R0);
+    a.ldi8(1, R4);
+    a.label("pause");
+    a.subn(R4, R0);
+    a.cmp_i(0, R0);
+    a.bne("pause");
+    a.label("again");
+    a.jmp_label("pass");
+    a.finish()
+}
+
+/// The TS pump when the aux core prefetches ([`aux_prefetch`]): up to [`PUMP_BATCH`] staged
+/// bursts of the capture into its endpoint, each guard-committed, the sent count back to
+/// [`AUX_TAIL`]. Stops when the staging is empty or the FIFO stays not ready. Same calling
+/// convention as [`ts_pump_for`].
+pub fn ts_pump_staged(p: &Pump) -> Vec<u8> {
+    use reg::*;
+    let c = p.index;
+    let mut a = Asm::new(p.address);
+    a.ldi8(PUMP_BATCH, R7); // r7 = burst budget
+    a.bra("loop");
+    a.label("done");
+    a.ldi8(0, R4);
+    a.ret();
+    a.label("loop");
+    a.cmp_i(0, R7);
+    a.beq("done");
+    a.ldi32(aux_main_view(AUX_HEAD[c]), R1);
+    a.ld(R1, R2); // r2 = head
+    a.ldi32(aux_main_view(AUX_TAIL[c]), R1);
+    a.ld(R1, R6); // r6 = tail
+    a.cmp(R6, R2);
+    a.beq("done");
+    a.ldi32(p.fifo_ctrl, R1);
+    a.ldi20(FIFO_POLL, R3);
+    a.label("fifo_wait");
+    a.ld(R1, R0);
+    a.ldi8(4, R4);
+    a.and(R4, R0);
+    a.cmp_i(0, R0);
+    a.bne("fifo_ok");
+    a.ldi8(1, R4);
+    a.subn(R4, R3);
+    a.cmp_i(0, R3);
+    a.beq("done");
+    a.bra("fifo_wait");
+    a.label("fifo_ok");
+    // r1 = slot tail % AUX_SLOTS, r5 = its end.
+    a.mov(R6, R1);
+    a.ldi8((AUX_SLOTS - 1) as u8, R0);
+    a.and(R0, R1);
+    a.lsl_i(9, R1);
+    a.ldi32(aux_main_view(AUX_STAGE[c]), R0);
+    a.addn(R0, R1);
+    a.mov(R1, R5);
+    a.ldi20(FIFO_BLOCK_BYTES, R0);
+    a.addn(R0, R5);
+    a.ldi32(p.fifo, R4);
+    a.label("copyw");
+    a.ld(R1, R0);
+    a.st(R0, R4);
+    a.addn_i(4, R1);
+    a.cmp(R5, R1);
+    a.bne("copyw");
+    // Commit, the low byte only (as ts_pump_for).
+    a.ldi32(EP_BYTE_ENABLE, R1);
+    a.ldi8(8, R0);
+    a.st(R0, R1);
+    a.ldi32(p.fifo_ctrl, R3);
+    a.ldi8(4, R0);
+    a.st(R0, R3);
+    a.ldi8(0xf, R0);
+    a.st(R0, R1);
+    a.addn_i(1, R6);
+    a.ldi32(aux_main_view(AUX_TAIL[c]), R1);
+    a.st(R6, R1);
+    a.ldi8(1, R1);
+    a.subn(R1, R7);
+    a.jmp_label("loop");
+    a.finish()
+}
+
 /// Where the TS pump is uploaded (boot0 RAM, past the monitor body at 0xe1000).
 pub const PUMP_ADDRESS: u32 = 0x000e_1200;
+/// Where the second TS pump ([`PUMP_B`]) is uploaded, after the first, still inside the
+/// 0x800 bytes at [`BODY_ADDRESS`].
+pub const PUMP_B_ADDRESS: u32 = 0x000e_1400;
+
+// ---- The units' output path ----
+//
+// Units 0x016 and 0x018 (the stock firmware runs its TS multiplexer on their cores) each
+// have ring readers, a buffer, an engine and an output block, and a USB stream channel takes
+// the output block's packets straight into an endpoint's FIFO, at up to about 40 MB/s. The
+// feeder below runs on the unit's own FR core: it reads each whole record the capture has
+// written into the unit's buffer with reader 2 and has the engine send it to the output
+// block. No CPU copies the TS. The host sets the unit, the channel and the endpoint up
+// (`dt295-rawfw`'s `hwpath`).
+
+/// Where a unit's feeder is loaded and entered (the unit core's view; the main core sees the
+/// unit's RAM at the unit's base + this).
+pub const FEEDER_ENTRY: u32 = 0x000a_2d00;
+/// The unit core's reset vector (unit view; write-only).
+pub const FEEDER_VECTOR: u32 = 0x000f_fffc;
+// The feeder's mailbox (unit view), each word in its own 64 bytes (a main-core store rewrites
+// the words around it with what it read a moment before).
+/// The host's request: a generation to feed (a new one starts at the capture's read offset),
+/// 0 to stop.
+pub const FEEDER_GO: u32 = 0x000a_3f00;
+/// Records sent since the last generation started (the feeder's).
+pub const FEEDER_SENT: u32 = 0x000a_3f40;
+/// 1 once the feeder has seen [`FEEDER_GO`] at 0 (the host clears it before a start).
+pub const FEEDER_STOPPED: u32 = 0x000a_3f80;
+/// A counter the feeder bumps every pass: it runs.
+pub const FEEDER_ALIVE: u32 = 0x000a_3fc0;
+/// How long the feeder pauses (register-only loop passes) when it has nothing to send, so
+/// that its polling leaves the bus to the main core.
+const FEEDER_PAUSE: u32 = 0x100;
+// The unit's registers the feeder drives (unit view; the buffer manager's are 16-bit, in the
+// upper half of the word).
+/// Reader 2: start offset, end offset, length, go (0x01000000; bits 24-25 busy).
+const RD2_START: u32 = 0x1048;
+const RD2_END: u32 = 0x1038;
+const RD2_LEN: u32 = 0x1078;
+const RD2_GO: u32 = 0x1068;
+/// Buffer region 2: the write position (reader 2's) and the read position (the engine's).
+const BUF2_WRITE: u32 = 0x0001_0058;
+const BUF2_READ: u32 = 0x0001_0068;
+/// The engine: length - 1, and the command (bits 0-2 busy).
+const ENG_LEN: u32 = 0x2004;
+const ENG_CMD: u32 = 0x2000;
+/// One record from buffer region 2 to the output block, as it is.
+pub const ENG_SEND: u32 = 0x0d00_0041;
+
+/// The feeder for capture `p` (any unit core: it uses the unit's registers at its local 0).
+/// While [`FEEDER_GO`] holds a generation it sends every whole record of the ring the capture
+/// has written, one at a time (reader 2 into the buffer, then the engine), and hands the read
+/// offset back; a new generation starts again at the capture's read offset. With
+/// [`FEEDER_GO`] at 0 it sends nothing and writes 1 to [`FEEDER_STOPPED`]. It never touches
+/// USB.
+pub fn unit_feeder(p: &Pump) -> Vec<u8> {
+    use reg::*;
+    let mut a = Asm::new(FEEDER_ENTRY);
+    a.ldi32(FEEDER_GO, R8);
+    a.ldi32(FEEDER_SENT, R10);
+    a.ldi32(FEEDER_ALIVE, R12);
+    a.ldi8(1, R7);
+    a.ldi8(0, R6); // r6 = the generation being fed
+    a.ldi32(RING_SIZE, R9);
+    a.ldi32(RECORD_BYTES, R11);
+    a.label("pass");
+    a.ld(R12, R1);
+    a.addn_i(1, R1);
+    a.st(R1, R12);
+    a.ld(R8, R0);
+    a.cmp_i(0, R0);
+    a.bne("go");
+    a.ldi32(FEEDER_STOPPED, R4);
+    a.st(R7, R4);
+    a.ldi8(0, R6);
+    a.bra("pause");
+    a.label("go");
+    a.cmp(R6, R0);
+    a.beq("feed");
+    // a new generation: from the capture's read offset (the host's, 0 after a set-up)
+    a.mov(R0, R6);
+    a.ldi32(p.ring_read, R4);
+    a.ld(R4, R2); // r2 = read offset
+    a.ldi8(0, R3); // r3 = records sent
+    a.st(R3, R10);
+    a.label("feed");
+    // r1 = what the ring holds: (write - read) mod size
+    a.ldi32(p.ring_write, R4);
+    a.ld(R4, R1);
+    a.cmp(R2, R1);
+    a.bc("wrapped");
+    a.subn(R2, R1);
+    a.bra("held");
+    a.label("wrapped");
+    a.subn(R2, R1);
+    a.addn(R9, R1);
+    a.label("held");
+    a.cmp(R11, R1);
+    a.bc("pause");
+    // r13 = where reader 2 puts the record in the buffer
+    a.ldi32(BUF2_WRITE, R4);
+    a.ld(R4, R13);
+    a.ldi20(RD2_START, R4);
+    a.st(R2, R4);
+    a.mov(R2, R5);
+    a.addn(R11, R5);
+    a.cmp(R9, R5);
+    a.bc("nowrap");
+    a.subn(R9, R5);
+    a.label("nowrap"); // r5 = the record's end, the next read offset
+    a.ldi20(RD2_END, R4);
+    a.st(R5, R4);
+    a.ldi20(RD2_LEN, R4);
+    a.st(R11, R4);
+    a.ldi20(RD2_GO, R4);
+    a.ldi32(0x0100_0000, R0);
+    a.st(R0, R4);
+    a.label("reading");
+    a.ld(R4, R0);
+    a.ldi32(0x0300_0000, R1);
+    a.and(R1, R0);
+    a.bne("reading");
+    // the engine reads from the record's start, whatever it consumed before
+    a.ldi32(BUF2_READ, R4);
+    a.st(R13, R4);
+    a.ldi20(ENG_LEN, R4);
+    a.mov(R11, R0);
+    a.subn(R7, R0);
+    a.st(R0, R4);
+    a.ldi20(ENG_CMD, R4);
+    a.ldi32(ENG_SEND, R0);
+    a.st(R0, R4);
+    a.label("sending");
+    a.ld(R4, R0);
+    a.ldi8(7, R1);
+    a.and(R1, R0);
+    a.bne("sending");
+    a.mov(R5, R2);
+    a.ldi32(p.ring_read, R4);
+    a.st(R2, R4);
+    a.addn(R7, R3);
+    a.st(R3, R10);
+    a.bra("pass");
+    a.label("pause");
+    a.ldi32(FEEDER_PAUSE, R1);
+    a.label("wait");
+    a.subn(R7, R1);
+    a.cmp_i(0, R1);
+    a.bne("wait");
+    a.bra("pass");
+    a.finish()
+}
 
 #[cfg(test)]
 mod tests {
@@ -885,7 +1332,7 @@ mod tests {
     #[test]
     fn ts_pump_assembles_and_is_well_formed() {
         let p = ts_pump();
-        // Fits in boot0 RAM below the CALL-test routine (0xe1400) with room to spare.
+        // Fits in boot0 RAM below the second pump (0xe1400) with room to spare.
         assert!(p.len() < 0x200, "pump is {} bytes", p.len());
         assert!(p.len().is_multiple_of(2), "16-bit instruction stream");
         // Ends with RET (0x97 0x20).
@@ -896,10 +1343,105 @@ mod tests {
                 .any(|&[a, b]| a == 0x14 && (b & 0xf0) == 0x40),
             "a store to @r4 (the FIFO) is present"
         );
-        // The pump sits after the body (0xe1000, 216 B) and before its end, with the
-        // whole routine clear of the CALL-test routine at 0xe1400.
+        // The pump sits after the body (0xe1000, 216 B), and the second pump after it, both
+        // inside the 0x800 bytes boot0 reserves for the body.
         assert!(PUMP_ADDRESS >= BODY_ADDRESS + body().len() as u32);
-        assert!(PUMP_ADDRESS + p.len() as u32 <= 0x000e_1400);
+        assert!(PUMP_ADDRESS + p.len() as u32 <= PUMP_B_ADDRESS);
+        let b = ts_pump_for(&PUMP_B);
+        assert_eq!(b.len(), p.len(), "the same routine, other constants");
+        assert!(PUMP_B_ADDRESS + b.len() as u32 <= BODY_ADDRESS + BODY_CAPACITY as u32);
+    }
+
+    #[test]
+    fn the_second_pump_drains_its_own_ring_into_ep_0x86() {
+        let b = ts_pump_for(&PUMP_B);
+        let has = |v: u32| b.windows(4).any(|w| w == v.to_be_bytes());
+        for v in [
+            0x8240_0000,
+            0x00d2_2028,
+            0x00d2_202c,
+            0x00fd_bd98,
+            0x00fd_bd34,
+        ] {
+            assert!(has(v), "0x{v:08x} in the second pump");
+        }
+        for v in [
+            0x8200_0000,
+            0x0190_2028,
+            0x0190_202c,
+            0x00fd_bd84,
+            0x00fd_bd0c,
+        ] {
+            assert!(!has(v), "0x{v:08x} not in the second pump");
+        }
+        assert_eq!(ts_pump(), ts_pump_for(&PUMP_A));
+    }
+
+    #[test]
+    fn the_aux_prefetch_fits_below_its_mailbox() {
+        let (image, sig) = aux_prefetch();
+        assert!(
+            AUX_ENTRY + image.len() as u32 <= AUX_SIG,
+            "prefetch is {} bytes",
+            image.len()
+        );
+        assert!(AUX_STAGE[1] + AUX_SLOTS * FIFO_BLOCK_BYTES <= AUX_ENTRY);
+        assert_eq!(aux_prefetch(), (image.clone(), sig), "deterministic");
+        assert!(
+            image.windows(4).any(|w| w == sig.to_be_bytes()),
+            "writes its signature"
+        );
+        // Both rings, by their registers.
+        for p in [PUMP_A, PUMP_B] {
+            for v in [p.ring_read, p.ring_write, p.ring_base | 0x8000_0000] {
+                assert!(image.windows(4).any(|w| w == v.to_be_bytes()), "0x{v:08x}");
+            }
+        }
+        // The mailbox words keep 64 bytes apart.
+        let mut words: Vec<u32> = [AUX_SIG, AUX_ALIVE]
+            .into_iter()
+            .chain(AUX_RUN)
+            .chain(AUX_ACK)
+            .chain(AUX_HEAD)
+            .chain(AUX_TAIL)
+            .collect();
+        words.sort();
+        assert!(words.windows(2).all(|w| w[1] - w[0] >= 64));
+        assert!(*words.last().unwrap() < 0x000a_4000);
+    }
+
+    #[test]
+    fn the_staged_pumps_fit_and_drain_their_own_staging() {
+        for p in [PUMP_A, PUMP_B] {
+            let code = ts_pump_staged(&p);
+            assert!(
+                p.address + code.len() as u32 <= p.address + 0x200,
+                "{} bytes",
+                code.len()
+            );
+            let has = |v: u32| code.windows(4).any(|w| w == v.to_be_bytes());
+            assert!(has(aux_main_view(AUX_STAGE[p.index])));
+            assert!(has(aux_main_view(AUX_TAIL[p.index])));
+            assert!(has(p.fifo) && has(p.fifo_ctrl));
+            assert!(!has(aux_main_view(AUX_STAGE[1 - p.index])));
+            assert!(!has(p.ring_read), "the prefetch owns the read offset");
+        }
+    }
+
+    #[test]
+    fn the_unit_feeders_follow_their_own_capture() {
+        for p in [PUMP_A, PUMP_B] {
+            let code = unit_feeder(&p);
+            assert!(code.len() < 0x1000, "{} bytes", code.len());
+            assert!(FEEDER_ENTRY + (code.len() as u32) <= FEEDER_GO);
+            let has = |v: u32| code.windows(4).any(|w| w == v.to_be_bytes());
+            assert!(has(p.ring_write) && has(p.ring_read));
+            assert!(has(FEEDER_GO) && has(FEEDER_SENT) && has(FEEDER_STOPPED));
+            assert!(has(ENG_SEND) && has(BUF2_WRITE) && has(BUF2_READ));
+            let other = if p.index == 0 { PUMP_B } else { PUMP_A };
+            assert!(!has(other.ring_write));
+            assert!(!has(p.fifo), "the feeder never touches USB");
+        }
     }
 
     #[test]

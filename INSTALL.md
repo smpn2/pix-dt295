@@ -1,21 +1,31 @@
 # 導入手順
 
-PIX-DT295 を Windows (TVTest) と Linux (mirakc + EPGStation) で使い始めるまでの手順。
+PIX-DT295(W) と PIX-DT195(W) を Windows (TVTest) と Linux (mirakc + EPGStation) で使い始めるまでの手順。
+PIX-DT295W と PIX-DT195 は、実機では確認していない (同じ構成の PIX-DT195W と PIX-DT295 と同じ処理で動かす)。
 設定やコマンドの詳しい説明は [docs/usage.md](docs/usage.md) にある。
 
 ## 必要なもの
 
-- PIX-DT295 本体と、本体に挿した契約済みの B-CAS カード
+- PIX-DT295(W) か PIX-DT195(W) の本体と、本体に挿した契約済みの B-CAS カード
 - 純正ドライバーパッケージのファームウェア 2 つ: `mb86m01_assp_osec_idle.bin` (起動用) と `mb86m01_assp_osec_trc_m_h.bin` (トランスコーダー用)。
   再配布できないので、ピクセラのサイトにある次のどちらかの zip から取り出す。
   - [brk_driver.zip](https://www.pixela.co.jp/support/info/2023/win11_stationtvx/brk_driver.zip): zip の直下
   - [stationtvx_updater12030002.zip](https://www.pixela.co.jp/products/tv_capture/pix_dt460/data/stationtvx_updater12030002.zip) (PIX-DT460 用): `Driver/selene/usb/x64/` などのフォルダー
 
   どちらも中身は同じで、SHA256 は次のとおり。
+  PIX-DT195(W) (Mac 用の機種) にも、この Windows 用のファイルを使える。
 
   ```
   3c4721204a987a5e8a818be4ac14ee2709a4786413a7ef77ddb33573370dd9d3  mb86m01_assp_osec_idle.bin
   a3520f60e80f08008621dcf44679474906e43a4de36770d769cd7642b19ddd0b  mb86m01_assp_osec_trc_m_h.bin
+  ```
+
+  どの機種にも、Mac 用のソフト (StationTV for Mac、Xit for Mac) に入っている同じ名前の 2 つも使える。
+  アプリの中の `DT195Lib.framework/Versions/A/Resources/` にあり、SHA256 は次のとおり。
+
+  ```
+  6d251c471ceb9ab8494fcd0feb256f39c19528f38bafab9bb7e4ec627e4412dd  mb86m01_assp_osec_idle.bin
+  07082da1cd77dff76c6565a5e8b4282d53a6dae6ba26c9dd880214a063711aff  mb86m01_assp_osec_trc_m_h.bin
   ```
 - ソースからビルドするときは Rust 1.100 以上、Windows では MSVC も (BonDriver の C++ の shim 用)
 
@@ -94,6 +104,8 @@ cargo build --release -p dt295-cli --target aarch64-apple-darwin  # ARM64
    ```
 
    純正のアプリ (StationTV X) に戻すときは `dt295 driver restore`。
+   PIX-DT195W には Windows の純正ドライバーが無いので、挿しただけではドライバーが割り当てられず、`install` が必要。
+   PIX-DT195 も、Xit の Windows 用ドライバーを入れていなければ同じ。
 
 2. TVTest の BonDriver のフォルダーに、`BonDriver_DT295.dll`, `BonDriver_DT295.ini` (見本はリリースの zip と `src/dt295-bondriver/BonDriver_DT295.ini`), `dt295.exe`, ファームウェア 2 つを置く。
    ini は DLL と同じ名前にする。
@@ -105,7 +117,11 @@ cargo build --release -p dt295-cli --target aarch64-apple-darwin  # ARM64
 
 4. 複数台のときは、台数分 DLL と ini を複製し (`BonDriver_DT295-1.dll` と `BonDriver_DT295-1.ini` など)、それぞれの ini の `DeviceSerial` で個体を区別
 
-5. (任意) BS / CS の局ロゴ。
+5. PIX-DT295W と PIX-DT195W の 2 つのチューナーを同時に使うときは、DLL と ini をチューナーごとに複製し (`BonDriver_DT295-1` と `BonDriver_DT295-2` など)、2 つ目の ini の `[Tuner]` に `TunerNumber=2` を書く。
+   2 つの TVTest は、同じフォルダーの `dt295 serve` を通して同時に視聴できる。
+   チャンネルスキャンは DLL ごとに行う。
+
+6. (任意) BS / CS の局ロゴ。
    通常の視聴では TVTest にほとんど取り込まれないので、`dt295 logo` で受信して TVTest のロゴファイルに追加する:
 
    ```
@@ -126,7 +142,7 @@ cargo build --release -p dt295-cli --target aarch64-apple-darwin  # ARM64
 System1 モードがデバイスの中でデスクランブルするのに対し、raw-TS モードはスクランブルされたままの TS を TVTest に渡し、解除は TVTest の CAS プラグインに任せる。
 ini の `[Tuner] RawTS=1` で切り替わる (切り替えたら、TVTest をすべて閉じてから開き直す)。内部の仕組みと機能差は [docs/raw-ts.md](docs/raw-ts.md)。
 
-- ファームウェアは要らない。レジデント (チップに常駐させる第三者のコード) も補助コア (demod を動かす副 CPU) も純正ファームも使わず、ホストがチップを cold (電源投入直後) から自力で立ち上げる (完全に自前コードのみ)
+- ファームウェアは要らない。レジデント (チップに常駐させる第三者のコード) も純正ファームも使わず (ユニットのコアと補助コアで動くのも自前のコードのみ)、ホストがチップを cold (電源投入直後) から自力で立ち上げる (完全に自前コードのみ)
 - B-CAS の解除は TVTest 側 (CAS プラグインと PC/SC リーダーの契約済みカード) が行う。System1 と違い、デバイスのスロットのカードは使わない
 - 最初の選局は cold の個体が必要。閉じて開き直すだけなら差し直しは要らない
 
@@ -227,6 +243,7 @@ EPGStation は mirakc を Mirakurun として使う。
    ```
 
    個体が複数なら、`tuners` に個体ごとに 1 つ書く。
+   PIX-DT295W と PIX-DT195W は、2 つ目のチューナーを `dt295 tune --serial <シリアル番号> --tuner 2 {{{extra_args}}}` でもう 1 つ書く。
    TVTest のスキャン結果 (ini と .ch2) があれば、`dt295 mirakc-channels --bondriver <ini>` でも作れる。
 
 8. mirakc を起動する。

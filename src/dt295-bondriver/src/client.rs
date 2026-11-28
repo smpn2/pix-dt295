@@ -70,6 +70,8 @@ pub struct Settings {
     pub dir: PathBuf,
     /// `[Tuner] DeviceSerial`; `None` = the only unit connected.
     pub serial: Option<String>,
+    /// `[Tuner] TunerNumber`: 1, or 2 (a two-tuner model's second).
+    pub tuner: u8,
     /// `[Tuner] RawTS`.
     pub mode: Mode,
     /// `[Server] IdleExitSec`: the daemon ends after this long without a client (0 =
@@ -261,14 +263,20 @@ fn launch_spec(s: &Settings, target: &Target) -> Launch {
     }
 }
 
-/// One status request: the unit's serial number and C/N when the daemon answered `ok`,
-/// `None` when it answered otherwise (no unit there), [`NoAnswer`] when it did not.
-fn status_of(target: &Target, unit: &str) -> Result<Option<(String, Option<i32>)>, NoAnswer> {
+/// One status request for a tuner: the unit's serial number and the C/N of the tuner's
+/// stream when the daemon answered `ok`, `None` when it answered otherwise (no unit
+/// there), [`NoAnswer`] when it did not.
+fn status_of(
+    target: &Target,
+    unit: &str,
+    tuner: u8,
+) -> Result<Option<(String, Option<i32>)>, NoAnswer> {
     let conn = ipc::connect(target).map_err(|e| NoAnswer::Unreachable(e.to_string()))?;
     conn.set_read_timeout(Some(STATUS_TIMEOUT))
         .map_err(|e| no_answer(&e))?;
     let req = StatusRequest {
         unit: unit.to_owned(),
+        tuner,
     };
     (&conn)
         .write_all(format!("{}\n", req.to_line()).as_bytes())
@@ -311,7 +319,11 @@ impl Inner {
     fn status(&self) -> Result<Option<(String, Option<i32>)>, NoAnswer> {
         let unit = lock(&self.unit).clone();
         let unit = unit.or_else(|| self.settings.serial.clone());
-        status_of(&self.target, unit.as_deref().unwrap_or(""))
+        status_of(
+            &self.target,
+            unit.as_deref().unwrap_or(""),
+            self.settings.tuner,
+        )
     }
 
     fn spawn_server(&self) -> Result<Child, String> {
@@ -452,6 +464,7 @@ impl Inner {
         let t0 = Instant::now();
         let req = Request {
             unit: self.settings.serial.clone().unwrap_or_default(),
+            tuner: self.settings.tuner,
             tuning: want.tuning,
             sid: want.sid,
             mode: Some(self.settings.mode),
@@ -800,6 +813,7 @@ mod tests {
         Settings {
             dir: dir.to_owned(),
             serial: None,
+            tuner: 1,
             mode: Mode::System1,
             idle_exit_secs: 5,
             start_timeout_secs: 5,
@@ -880,7 +894,7 @@ mod tests {
         assert_eq!(next_pause(Duration::from_secs(20)), RETRY_MAX);
         let retried = |why: &str| matches!(StartError::of_reply(why.into()), StartError::Retry(_));
         assert!(retried("unit AB12345678 is not connected"));
-        assert!(retried("no PIX-DT295 is connected"));
+        assert!(retried("no PIX-DT295(W) / PIX-DT195(W) is connected"));
         assert!(!retried("no lock (C/N 3.2 dB)"));
         assert!(!retried(
             "unit AB12345678 streams raw-TS (the path it was opened on), not System1"

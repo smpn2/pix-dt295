@@ -28,7 +28,7 @@ use crate::ts::psi::StreamView;
 use crate::ts::route::{Op, Router};
 use crate::ts::stats::RawStats;
 use crate::ts::{link, packet, pat};
-use dt295_core::fe1;
+use dt295_core::fe1::{self, FrontEnd};
 use dt295_core::proto::{Io, sleep_ms};
 use dt295_core::signal::{cn_s_mdb, cn_t_mdb};
 
@@ -89,8 +89,9 @@ impl Output {
 /// What the worker needs from the host at start.
 #[derive(Debug)]
 pub(crate) struct Config {
-    /// The tuned system (the demod to sample).
+    /// The tuned system and front end (the demod to sample).
     pub sys: Option<System>,
+    pub fe: FrontEnd,
     pub output: Output,
 }
 
@@ -447,6 +448,8 @@ struct Run<'a> {
     stats: RawStats,
     /// Bytes handed to the sink.
     total: u64,
+    /// Null packets of the device's TS left out of the sink.
+    nulls: u64,
     reads: u64,
     full_reads: u64,
     last_data: Option<Instant>,
@@ -477,6 +480,7 @@ struct Run<'a> {
     /// packet instead of passing it with TEI set, so TEI 0 alone does not clear the RF
     /// side. Stops for the stream at the first failed read.
     dm_sat: bool,
+    dm_fe: FrontEnd,
     dm_on: bool,
     dm_last: Option<Instant>,
     /// PSI keeper output, handed to the sink before the buffer.
@@ -512,6 +516,7 @@ impl<'a> Run<'a> {
             lost_logged: false,
             stats: RawStats::new(),
             total: 0,
+            nulls: 0,
             reads: 0,
             full_reads: 0,
             last_data: None,
@@ -526,6 +531,7 @@ impl<'a> Run<'a> {
             win: Minute::new(0, t_start),
             ev_last: None,
             dm_sat: cfg.sys == Some(System::Satellite),
+            dm_fe: cfg.fe,
             dm_on: cfg.sys.is_some(),
             dm_last: None,
             out: Vec::new(),
@@ -749,7 +755,13 @@ impl<'a> Run<'a> {
             if !self.out.is_empty() {
                 sink(&self.out[..]);
             }
-            sink(&self.acc[s..n]);
+            // The null packets carry nothing (the routes take them so that the first TS
+            // comes at once); they go after the statistics and the PSI saw them.
+            let kept = dt295_core::ts::drop_null(&mut self.acc[s..n]);
+            self.nulls += ((n - s - kept) / P) as u64;
+            if kept > 0 {
+                sink(&self.acc[s..s + kept]);
+            }
         }
         self.total += n as u64;
         self.sh.live.set_delivered(self.total); // for the PAT probe's present / absent test
@@ -882,9 +894,9 @@ impl<'a> Run<'a> {
 
     fn demod_sample(&mut self, io: &mut Io, now: Instant) {
         let sample = if self.dm_sat {
-            fe1::sample_s(io)
+            fe1::sample_s(io, self.dm_fe)
         } else {
-            fe1::sample_t(io).map(|(lock, cn)| (lock, cn, 0, 0))
+            fe1::sample_t(io, self.dm_fe).map(|(lock, cn)| (lock, cn, 0, 0))
         };
         match sample {
             Err(_) => {
@@ -973,11 +985,11 @@ impl<'a> Run<'a> {
         if let Some(s) = st.psi.end_summary() {
             info!("{s}");
         }
-        let (stats, total) = (&self.stats, self.total);
+        let (stats, total, nulls) = (&self.stats, self.total, self.nulls);
         let pats = self.pats;
         info!(
-            "s1 worker: delivered {total} bytes, {pats} PAT(s), {} SDT packet(s), {} distinct \
-             PID(s)",
+            "s1 worker: received {total} bytes ({nulls} null packets left out), {pats} PAT(s), \
+             {} SDT packet(s), {} distinct PID(s)",
             stats.sdt_packets, stats.distinct_pids
         );
         if self.reads > 0 {

@@ -7,8 +7,12 @@
 //! are from analysis provided by a third party, who drove this controller from the host
 //! on a PIX-DT295.
 
+use dt295_core::fe1::{self, FrontEnd, Port};
 use dt295_core::proto::Io;
-use dt295_core::{Error, Result, Status, System, fe1};
+use dt295_core::{Error, Result, Status, System};
+use dt295_frmon::{Pump, RING_SIZE};
+
+use crate::IoAccess;
 
 /// The USB-core-block instance base (the host face of the demod I2C controller).
 const BASE: u32 = 0x00FD_8FE0;
@@ -204,107 +208,218 @@ fn restore_windows(io: &Io) {
     let _ = window_set(io, READ_WINDOW, 0x00F0_0000);
 }
 
-// --- The capture engine (0x0190xxxx) ---
+// --- The two TS captures ---
 //
-// What brings it up so the ring fills with the demod's TS, as a third party established on
-// a PIX-DT295 by leaving out one write at a time, on the first session after a power-up and
-// on a later one. What most of these registers do is not known; the comments say what
-// leaving each out did. The vendor's sequence writes far more (a 0x3002FFFF reset pulse
-// with 0x1900020, the mode word 0x1902000, most of the 0x1901xxx block, the input gate
-// 0xF12788, the demod sub-block 0x16000xx, a reset of the TS endpoint); leaving any of those
-// out changed nothing, so they are not written.
+// The chip has two TS captures of the same form, each an input (the demod's TS in) and a DMA
+// engine that writes 192-byte records into a ring in SDRAM: the first at 0x0190xxxx, the
+// second at 0x00D2xxxx. The input selection takes the TS pins; on a PIX-DT195W a pin setting
+// (`TS_PINS_B`) puts the demod's output B on the second input, so the two tuners stream at
+// once (the stock firmware's System2 path uses the second the same way).
+//
+// The first capture's bring-up is what a third party established on a PIX-DT295 by leaving
+// out one write at a time, on the first session after a power-up and on a later one. What
+// most of these registers do is not known; the comments say what leaving each out did. The
+// vendor's sequence writes far more (a 0x3002FFFF reset pulse with 0x1900020, the mode word
+// 0x1902000, most of the 0x1901xxx block, the input gate 0xF12788, the demod sub-block
+// 0x16000xx, a reset of the TS endpoint); leaving any of those out changed nothing, so they
+// are not written. The second capture takes the same input and engine writes.
 
-/// The unit gate (16-bit): at its cold value the capture block reads 0 and drops writes.
+/// Which TS capture a stream takes: the first (0x0190xxxx, the demod's output A) or the
+/// second (0x00D2xxxx, output B: a two-tuner model's second tuner).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Capture {
+    A,
+    B,
+}
+
+/// The bulk IN endpoint of the second capture's TS (the first's is [`dt295_core::EP_TS`]).
+pub const EP_TS_B: u8 = 0x86;
+
+impl Capture {
+    /// The capture that takes `fe`'s TS (by its demod output).
+    pub fn of(fe: FrontEnd) -> Self {
+        match fe.port() {
+            Port::A => Capture::A,
+            Port::B => Capture::B,
+        }
+    }
+
+    /// The on-chip pump that drains this capture's ring into its endpoint.
+    pub fn pump(self) -> &'static Pump {
+        match self {
+            Capture::A => &dt295_frmon::PUMP_A,
+            Capture::B => &dt295_frmon::PUMP_B,
+        }
+    }
+
+    /// The bulk IN endpoint the pump feeds.
+    pub fn ep(self) -> u8 {
+        match self {
+            Capture::A => dt295_core::EP_TS,
+            Capture::B => EP_TS_B,
+        }
+    }
+
+    /// The input's registers (past the 24-bit window for the first: [`win_write32`]).
+    fn input(self) -> u32 {
+        match self {
+            Capture::A => 0x0190_1000,
+            Capture::B => 0x00D2_1000,
+        }
+    }
+
+    /// Its block's control words (reset, clock, wake).
+    fn block(self) -> u32 {
+        match self {
+            Capture::A => 0x0190_0000,
+            Capture::B => 0x00D0_0000,
+        }
+    }
+
+    /// The engine's registers.
+    fn engine(self) -> u32 {
+        match self {
+            Capture::A => 0x0190_2000,
+            Capture::B => 0x00D2_2000,
+        }
+    }
+
+    /// The input selection. The stock firmware's System2 path writes 0x0606 for the second;
+    /// 0x0607 takes the TS there too.
+    fn select(self) -> u16 {
+        match self {
+            Capture::A => 0x0607,
+            Capture::B => 0x0606,
+        }
+    }
+}
+
+/// The unit gate (16-bit): at its cold value (0x9000) both captures' blocks read 0 and drop
+/// writes.
 const UNIT_GATE: u32 = 0x00F1_0118;
-/// The capture block's wake bit: bit 18 (bit 2 of the high half-word).
-const CAP_WAKE: u32 = 0x0190_0404;
+/// The wake bit of a capture's block: bit 18 (bit 2 of the high half-word) of +0x404.
+const CAP_WAKE: u32 = 0x404;
 const CAP_WAKE_BIT: u32 = 0x0004_0000;
-/// The input's run word: set by the arm, cleared by the stop.
-const CAP_INPUT_RUN: u32 = 0x0190_1040;
-/// The engine: [`CAP_RUN`] starts it, [`CAP_STOP`] stops it; it reads 0 once stopped.
-const CAP_ENGINE: u32 = 0x0190_2010;
+/// The first capture's two head words, written first: written last, nothing reached the ring
+/// on the first session after a power-up. Without either, nothing reaches it.
+const HEAD_A: [(u32, u32); 2] = [(0x0190_0000, 0x0002_0000), (0x0190_0004, 0x0000_1100)];
+
+// The second capture shares its block's reset and clock words (0x00D00000 / 0x00D00004) with
+// other units, so its bring-up changes only its own bits. Measured on a PIX-DT195W by putting
+// each word back towards its cold value: only these bits stop the ring when left out.
+/// Bit 7 holds the second capture in reset (cold 0xF0021F9F).
+const B_RESET: u32 = 0x00D0_0000;
+const B_RESET_BIT: u32 = 0x0000_0080;
+/// Bits 10 and 13 clock its input and its engine (cold 0x01000000). The first capture's are
+/// bits 8 and 12 of its own block's word.
+const B_CLOCK: u32 = 0x00D0_0004;
+const B_CLOCK_BITS: u32 = 0x0000_2400;
+/// The TS pins (16-bit): bit 6 gives the second input the demod's output B. Without it the
+/// second input takes output A, as the first does (cold 0x3830 on a PIX-DT195W).
+const TS_PINS: u32 = 0x00F1_012C;
+const TS_PINS_B: u16 = 0x0040;
+
+/// Offsets in a capture's input.
+const IN_SELECT: u32 = 0x000; // 16-bit
+const IN_WORD: u32 = 0x004;
+const IN_RUN: u32 = 0x040; // set by the arm, cleared by the stop
+const IN_LENGTH: u32 = 0x044;
+const IN_080: u32 = 0x080;
+/// Offsets in a capture's engine.
+const ENG_RUN: u32 = 0x010; // CAP_RUN starts it, CAP_STOP stops it; reads 0 once stopped
+const ENG_BASE: u32 = 0x020;
+const ENG_SIZE: u32 = 0x024;
+const ENG_WRITE: u32 = 0x028; // the hardware advances it
+const ENG_READ: u32 = 0x02C; // the pump advances it
 const CAP_RUN: u32 = 0x0200_0000;
 const CAP_STOP: u32 = 0x0400_0000;
-/// The ring's write offset; the hardware advances it.
-const CAP_RING_WRITE: u32 = 0x0190_2028;
 
-/// The capture arm (addr, value, is_half), in order; the engine start comes after it.
-const CAPTURE_ARM: &[(u32, u32, bool)] = &[
-    // The two words at the head of the block, first: written last, nothing reached the
-    // ring on the first session after a power-up. Without either, nothing reaches it.
-    (0x0190_0000, 0x0002_0000, false),
-    (0x0190_0004, 0x0000_1100, false),
+/// Arm a capture, stopping its engine first if a stream left it running. Does not start it
+/// ([`host_start_capture`]). The first capture's registers are past the 24-bit window and go
+/// over the host bank window; the second's are inside it.
+fn host_configure_capture(io: &Io, cap: Capture, log: &mut Vec<String>) -> Result<()> {
+    let (input, engine) = (cap.input(), cap.engine());
+    // The unit's feeder and the aux core's prefetch let go of the read offset before it is
+    // zeroed below.
+    crate::hwpath::stop(io, cap)?;
+    crate::prefetch::release(io, cap.pump().index)?;
+    if win_read32(io, engine + ENG_RUN)? != 0 {
+        // A stream that ended without the stop: a worker that died, or an older build.
+        log.push(format!("capture {cap:?} still running: stopping it first"));
+        stop_engine(io, cap)?;
+    }
+    // Opening the gate again when it is open leaves a running capture as it is.
+    io.write16(UNIT_GATE, 0xFFFF)?;
+    let wake_reg = cap.block() + CAP_WAKE;
+    let wake = win_read32(io, wake_reg)?;
+    win_write32(io, wake_reg, wake | CAP_WAKE_BIT)?;
+    if win_read32(io, wake_reg)? & CAP_WAKE_BIT == 0 {
+        // The block is asleep, and nothing below would stick.
+        return Err(Error::State(format!(
+            "capture block asleep (0x{wake_reg:x} bit 18 did not take)"
+        )));
+    }
+    match cap {
+        Capture::A => {
+            for (addr, val) in HEAD_A {
+                win_write32(io, addr, val)?;
+            }
+        }
+        Capture::B => {
+            let pins = io.read16(TS_PINS)?;
+            io.write16(TS_PINS, pins | TS_PINS_B)?;
+            abs_w(io, B_CLOCK, abs_r(io, B_CLOCK)? | B_CLOCK_BITS)?;
+            abs_w(io, B_RESET, abs_r(io, B_RESET)? & !B_RESET_BIT)?;
+        }
+    }
     // The ring. Without the base or the length nothing reaches it; without the two offsets
     // zeroed, a later session starts where the last one stopped and sends old records first.
-    (0x0190_2020, dt295_frmon::RING_BASE, false),
-    (0x0190_2024, dt295_frmon::RING_SIZE, false),
-    (CAP_RING_WRITE, 0, false),
-    (dt295_frmon::REG_RING_READ, 0, false), // the pump advances it
+    win_write32(io, engine + ENG_BASE, cap.pump().ring_base)?;
+    win_write32(io, engine + ENG_SIZE, RING_SIZE)?;
+    win_write32(io, engine + ENG_WRITE, 0)?;
+    win_write32(io, engine + ENG_READ, 0)?;
     // The input selection (without it nothing reaches the ring), and the word that goes with
     // it (without it, on the first session after a power-up, the ring fills but no record
     // starts with 0x47).
-    (0x0190_1000, 0x0607, true),
-    (0x0190_1004, 0x0400_0000, false),
-    // 0xBC = 188, the TS packet length. Without it, or 0x1901080, nothing reaches the ring.
-    (0x0190_1044, 0x00BC_0000, false),
-    (0x0190_1080, 0x0100_0000, false),
-    (CAP_INPUT_RUN, 0x0300_0000, false),
-];
-
-/// Arm the capture engine over the host bank window, stopping it first if a stream left it
-/// running. Does not start it ([`host_start_capture`]).
-fn host_configure_capture(io: &Io, log: &mut Vec<String>) -> Result<()> {
-    if win_read32(io, CAP_ENGINE)? != 0 {
-        // A stream that ended without the stop: a worker that died, or an older build.
-        log.push("capture engine still running: stopping it first".into());
-        stop_engine(io)?;
-    }
-    io.write16(UNIT_GATE, 0xFFFF)?;
-    let wake = win_read32(io, CAP_WAKE)?;
-    win_write32(io, CAP_WAKE, wake | CAP_WAKE_BIT)?;
-    if win_read32(io, CAP_WAKE)? & CAP_WAKE_BIT == 0 {
-        // The block is asleep, and nothing below would stick.
-        return Err(Error::State(
-            "capture block asleep (0x1900404 bit 18 did not take)".into(),
-        ));
-    }
-    for &(addr, val, half) in CAPTURE_ARM {
-        if half {
-            win_write16(io, addr, val as u16)?;
-        } else {
-            win_write32(io, addr, val)?;
-        }
-    }
-    log.push("capture configured over the host bank window".into());
+    win_write16(io, input + IN_SELECT, cap.select())?;
+    win_write32(io, input + IN_WORD, 0x0400_0000)?;
+    // 0xBC = 188, the TS packet length. Without it, or +0x080, nothing reaches the ring.
+    win_write32(io, input + IN_LENGTH, 0x00BC_0000)?;
+    win_write32(io, input + IN_080, 0x0100_0000)?;
+    win_write32(io, input + IN_RUN, 0x0300_0000)?;
+    log.push(format!("capture {cap:?} configured"));
     Ok(())
 }
 
-/// Start the capture engine, over the host bank window.
-fn host_start_capture(io: &Io) -> Result<()> {
-    win_write32(io, CAP_ENGINE, CAP_RUN)
+/// Start a capture's engine.
+fn host_start_capture(io: &Io, cap: Capture) -> Result<()> {
+    win_write32(io, cap.engine() + ENG_RUN, CAP_RUN)
 }
 
 /// How many reads of the engine to wait for it to stop (each a control transfer).
 const STOP_POLLS: u32 = 500;
 
-/// Stop the capture engine: its stop word, the input's run word cleared, then the engine read
-/// back at 0. Measured by a third party on a PIX-DT295: left running, the next session's TS
-/// has a continuity error; with the run word left set, often only about 64 % of the next
-/// stream reaches the host.
-fn stop_engine(io: &Io) -> Result<()> {
-    win_write32(io, CAP_ENGINE, CAP_STOP)?;
-    win_write32(io, CAP_INPUT_RUN, 0)?;
+/// Stop a capture's engine: its stop word, the input's run word cleared, then the engine read
+/// back at 0. Measured by a third party on a PIX-DT295 (the first capture): left running,
+/// the next session's TS has a continuity error; with the run word left set, often only about
+/// 64 % of the next stream reaches the host.
+fn stop_engine(io: &Io, cap: Capture) -> Result<()> {
+    let engine = cap.engine() + ENG_RUN;
+    win_write32(io, engine, CAP_STOP)?;
+    win_write32(io, cap.input() + IN_RUN, 0)?;
     for _ in 0..STOP_POLLS {
-        if win_read32(io, CAP_ENGINE)? == 0 {
+        if win_read32(io, engine)? == 0 {
             return Ok(());
         }
     }
     Err(Error::Timeout("capture engine did not stop"))
 }
 
-/// Stop the capture engine at the end of a stream, and put the bank window back.
-pub fn stop_capture(io: &Io) -> Result<()> {
-    let stopped = stop_engine(io);
+/// Stop a capture's engine at the end of a stream, and put the bank window back.
+pub fn stop_capture(io: &Io, cap: Capture) -> Result<()> {
+    let path = crate::hwpath::stop(io, cap);
+    let released = crate::prefetch::release(io, cap.pump().index);
+    let stopped = stop_engine(io, cap).and(released).and(path);
     restore_windows(io);
     stopped
 }
@@ -436,15 +551,36 @@ pub fn demod_read_cold(io: &Io, slave: u8, reg: u8, restore: bool) -> (Result<u8
 /// and only the retune + capture rearm run (~1 s instead of ~2.5 s). Always: tune and lock
 /// over the host-face I2C, arm the capture engine over the stock bank window, start it.
 /// Returns whether the demod locked.
+#[allow(clippy::too_many_arguments)]
 fn cold_arm(
     io: &Io,
+    fe: FrontEnd,
     terrestrial: bool,
     freq_hz: u32,
     tsid: Option<u16>,
     full: bool,
     saved: &mut Saved,
     log: &mut Vec<String>,
-) -> Result<Status> {
+) -> Result<bool> {
+    cold_bring_up(io, fe, full, saved, log)?;
+    let locked = cold_tune_status(&mut FjBus::new(io), fe, terrestrial, freq_hz, tsid, log)?.locked;
+    // After the lock: arm the capture, then start it.
+    let cap = Capture::of(fe);
+    host_configure_capture(io, cap, log)?;
+    host_start_capture(io, cap)?;
+    log.push(format!("capture {cap:?} started"));
+    Ok(locked)
+}
+
+/// The once-per-plug bring-up when `full` and the chip is still cold (the front end, the
+/// demods' one-time init, the monitor), else only the host-face I2C setup of a retune.
+fn cold_bring_up(
+    io: &Io,
+    fe: FrontEnd,
+    full: bool,
+    saved: &mut Saved,
+    log: &mut Vec<String>,
+) -> Result<()> {
     use crate::frmon_host;
 
     // Gate first (full path only), read-only, BEFORE any board write: a chip that is not
@@ -467,37 +603,46 @@ fn cold_arm(
         // failure in the bring-up above leaves it absent and the next tune redoes the bring-up.
         {
             let mut bus = FjBus::new(io);
-            fe1::power_on_init(&mut bus)?;
+            fe1::power_on(&mut bus, fe)?;
         }
         frmon_host::install_write(io)?;
+        log.push("brought up from cold".into());
     } else {
         setup(io)?; // the host-face I2C controller (idempotent; cheap on a retune)
     }
+    Ok(())
+}
+
+/// Tune `fe` over `bus` and read its status (the lock, the C/N).
+fn cold_tune_status(
+    bus: &mut impl fe1::Bus,
+    fe: FrontEnd,
+    terrestrial: bool,
+    freq_hz: u32,
+    tsid: Option<u16>,
+    log: &mut Vec<String>,
+) -> Result<Status> {
     let status = {
-        let mut bus = FjBus::new(io);
         let sys = if terrestrial {
             // The same captured sequence as the System1 path. The T demod's 0x47 / 0x4F / 0x72
             // read 0x00 / 0x05 / 0x00 from a power-up on (and after a satellite tune), so there
             // is nothing to write there.
-            fe1::tune_t(&mut bus, freq_hz)?;
+            fe1::tune_t(bus, fe, freq_hz)?;
             System::Terrestrial
         } else {
-            let _ = fe1::tune_s(&mut bus, freq_hz, tsid.unwrap_or(dt295_core::chan::NO_TSID))?;
+            let _ = fe1::tune_s(bus, fe, freq_hz, tsid.unwrap_or(dt295_core::chan::NO_TSID))?;
             System::Satellite
         };
-        let st = fe1::read_status(&mut bus, sys)?;
+        let st = fe1::read_status(bus, fe, sys)?;
         log.push(format!(
-            "tune: locked={} C/N={}.{:03} dB",
+            "tune: tuner {} locked={} C/N={}.{:03} dB",
+            fe.tuner() + 1,
             st.locked,
             st.cn_mdb / 1000,
             (st.cn_mdb % 1000).abs()
         ));
         st
     };
-    // After the lock: arm the capture engine, then start it.
-    host_configure_capture(io, log)?;
-    host_start_capture(io)?;
-    log.push("capture started (0x1902010 = 0x02000000, host window)".into());
     Ok(status)
 }
 
@@ -545,6 +690,7 @@ fn reframe_188(buf: &[u8], phase: usize) -> Vec<u8> {
 /// vendor firmware. Leaves the engine running (the next arm stops it first).
 pub fn cold_capture(
     io: &Io,
+    fe: FrontEnd,
     terrestrial: bool,
     freq_hz: u32,
     tsid: Option<u16>,
@@ -552,13 +698,23 @@ pub fn cold_capture(
     let mut log = Vec::new();
     let mut saved: Saved = Vec::new();
     let result = (|| -> Result<bool> {
-        let locked = cold_arm(io, terrestrial, freq_hz, tsid, true, &mut saved, &mut log)?.locked;
-        let rp0 = win_read32(io, CAP_RING_WRITE)?;
+        let locked = cold_arm(
+            io,
+            fe,
+            terrestrial,
+            freq_hz,
+            tsid,
+            true,
+            &mut saved,
+            &mut log,
+        )?;
+        let ring_write = Capture::of(fe).engine() + ENG_WRITE;
+        let rp0 = win_read32(io, ring_write)?;
         std::thread::sleep(std::time::Duration::from_millis(300));
-        let rp1 = win_read32(io, CAP_RING_WRITE)?;
+        let rp1 = win_read32(io, ring_write)?;
         let flowing = rp1 != rp0;
         log.push(format!(
-            "ring write ptr 0x1902028: 0x{rp0:08x} -> 0x{rp1:08x} => {}",
+            "ring write ptr 0x{ring_write:x}: 0x{rp0:08x} -> 0x{rp1:08x} => {}",
             if flowing {
                 "ADVANCING (TS flowing into the ring)"
             } else {
@@ -578,37 +734,49 @@ pub fn cold_capture(
 /// fraction).
 pub fn cold_stream(
     io: &Io,
+    fe: FrontEnd,
     terrestrial: bool,
     freq_hz: u32,
     tsid: Option<u16>,
     secs: u64,
     out_path: Option<&str>,
 ) -> (Result<(u64, f32)>, Vec<String>) {
-    use crate::frmon_host::MonitorResident;
-    use dt295_core::EP_TS;
     use std::time::{Duration, Instant};
 
+    let cap = Capture::of(fe);
+    let ep = cap.ep();
     let mut log = Vec::new();
     let mut saved: Saved = Vec::new();
     let result = (|| -> Result<(u64, f32)> {
-        cold_arm(io, terrestrial, freq_hz, tsid, true, &mut saved, &mut log)?;
-        crate::frmon_host::upload_ts_pump(io)?;
+        cold_arm(
+            io,
+            fe,
+            terrestrial,
+            freq_hz,
+            tsid,
+            true,
+            &mut saved,
+            &mut log,
+        )?;
+        crate::frmon_host::upload_pump(io, cap.pump(), false)?;
         log.push("TS pump uploaded".into());
-        // Keep many reads posted on EP 0x81 the whole time: our pump only commits a FIFO
+        // Keep many reads posted on the EP the whole time: our pump only commits a FIFO
         // burst when the host has a read pending to drain it, so single reads after each
         // pump never find the FIFO ready. A read queue keeps ~48 reads outstanding.
-        let _ = io.usb.abort_pipe(EP_TS);
-        let mut queue = io.usb.read_queue(EP_TS, 48, 0x10000).ok();
+        let _ = io.usb.abort_pipe(ep);
+        let mut queue = io.usb.read_queue(ep, 48, 0x10000).ok();
         if queue.is_none() {
-            log.push("WARN: EP 0x81 read queue unavailable; using single reads".into());
+            log.push(format!(
+                "WARN: EP 0x{ep:02x} read queue unavailable; using single reads"
+            ));
         }
-        let mut rt = MonitorResident::new(io);
+        let mut seq = 0;
         let mut fallback = vec![0u8; 0x10000];
         let mut saved_bytes: Vec<u8> = Vec::new();
         let mut total: u64 = 0;
         let start = Instant::now();
         while start.elapsed() < Duration::from_secs(secs) {
-            let _ = rt.pump();
+            let _ = crate::frmon_host::call_pump(io, cap.pump(), &mut seq);
             match queue.as_mut() {
                 Some(q) => {
                     if let Ok(Some(data)) = q.next(Duration::from_millis(1)) {
@@ -619,7 +787,7 @@ pub fn cold_stream(
                     }
                 }
                 None => {
-                    if let Ok(n) = io.usb.read(EP_TS, &mut fallback, Duration::from_millis(20))
+                    if let Ok(n) = io.usb.read(ep, &mut fallback, Duration::from_millis(20))
                         && n > 0
                     {
                         total += n as u64;
@@ -649,53 +817,108 @@ pub fn cold_stream(
         }
         Ok((total, sync))
     })();
-    if let Err(e) = stop_capture(io) {
+    if let Err(e) = stop_capture(io, cap) {
         log.push(format!("capture stop: {e}"));
     }
     (result, log)
 }
 
-/// Blob-free COLD bring-up + arm + TS-pump upload, for the BonDriver cold raw-TS worker.
-/// `full` does the one-time bring-up (the first tune after a cold open); a channel change
-/// passes `full` = false and only retunes + rearms. After this returns, the capture engine
-/// streams into the ring and the monitor's TS pump is uploaded; the caller loops
-/// [`crate::frmon_host::MonitorResident::pump`] + EP 0x81 reads. Returns the demod's status
-/// after the tune (the lock, the C/N). No resident, no aux core, no vendor firmware.
-pub fn cold_prepare_stream(
-    io: &Io,
+/// Blob-free COLD bring-up + tune + capture start, for the raw-TS stream worker. `full` does
+/// the one-time bring-up (the first tune after a cold open); a channel change passes `full` =
+/// false and only retunes + rearms. After this returns, `fe`'s capture ([`Capture::of`])
+/// streams into its ring, and the ring goes to the capture's EP by the returned [`Feed`]: the
+/// unit's output path ([`crate::hwpath`]), or the main core's pump (uploaded; the caller loops
+/// [`crate::frmon_host::call_pump`]). The caller reads the EP either way. Returns the demod's
+/// status after the tune (the lock, the C/N) too. No resident and no vendor firmware; the
+/// unit cores and the aux core run only our code ([`crate::hwpath`], [`crate::prefetch`]).
+///
+/// The I/O is taken a step at a time, so a stream of the unit's other tuner keeps being pumped:
+/// the bring-up in one go (the other worker must not run its pump halfway through it), the tune
+/// one I2C transfer at a time ([`LockedBus`]; it sleeps between them), and the capture start
+/// with the path's start (or the pump upload) in one go.
+pub fn cold_prepare_stream<L: IoAccess>(
+    l: &L,
+    fe: FrontEnd,
     terrestrial: bool,
     freq_hz: u32,
     tsid: Option<u16>,
     full: bool,
-) -> Result<Status> {
+) -> Result<(Status, Feed)> {
+    let cap = Capture::of(fe);
     let mut log = Vec::new();
-    let mut saved: Saved = Vec::new();
-    let armed = cold_arm(io, terrestrial, freq_hz, tsid, full, &mut saved, &mut log);
-    for line in &log {
-        tracing::info!("cold raw-TS: {line}");
-    }
-    // Always put the bank window back to its default, even if cold_arm failed after moving it
-    // (in the capture configure): the worker's pump streams over the staging dispatch, not the
-    // window, and a stale capture-bank immediate would mis-map a later direct 0x80000..0x9FFFF
-    // access (e.g. the boot-state register 0x82008, the System1 start's reads). cold_capture /
-    // cold_stream restore it the same way on every path.
-    restore_windows(io);
-    let status = armed?;
-    crate::frmon_host::upload_ts_pump(io)?;
-    Ok(status)
+    let flush = |log: &mut Vec<String>| {
+        for line in log.drain(..) {
+            tracing::info!("cold raw-TS: {line}");
+        }
+    };
+    let up = l.with_io(|io| cold_bring_up(io, fe, full, &mut Vec::new(), &mut log));
+    flush(&mut log);
+    up?;
+    let status = cold_tune_status(
+        &mut LockedBus::new(l),
+        fe,
+        terrestrial,
+        freq_hz,
+        tsid,
+        &mut log,
+    );
+    flush(&mut log);
+    let status = status?;
+    let started = l.with_io(|io| {
+        let started =
+            host_configure_capture(io, cap, &mut log).and_then(|()| host_start_capture(io, cap));
+        // Always put the bank window back to its default, even if the configure failed after
+        // moving it: the pump streams over the staging dispatch, not the window, and a stale
+        // capture-bank immediate would mis-map a later direct 0x80000..0x9FFFF access (e.g. the
+        // boot-state register 0x82008, the System1 start's reads). cold_capture / cold_stream
+        // restore it the same way on every path.
+        restore_windows(io);
+        started?;
+        // The unit's output path takes the ring to the endpoint if it can. Failing that, the
+        // aux core's prefetch takes the ring and the pump drains what it stages; without it
+        // the pump drains the ring itself (about 8.6 MB/s for both captures).
+        match crate::hwpath::start(io, cap) {
+            Ok(()) => return Ok(Feed::Unit),
+            Err(Error::State(why)) => {
+                tracing::warn!("cold raw-TS: {why}; the main core pumps the ring");
+            }
+            Err(e) => return Err(e),
+        }
+        let staged = match crate::prefetch::take(io, cap.pump().index) {
+            Ok(()) => true,
+            Err(Error::Usb(e)) => return Err(Error::Usb(e)),
+            Err(e) => {
+                tracing::warn!("cold raw-TS: {e}; the main core pumps the ring itself");
+                false
+            }
+        };
+        crate::frmon_host::upload_pump(io, cap.pump(), staged)?;
+        Ok(Feed::Pump)
+    });
+    flush(&mut log);
+    Ok((status, started?))
+}
+
+/// What moves a capture's TS from its ring to its endpoint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Feed {
+    /// The unit's output path ([`crate::hwpath`]): nothing to call while it streams.
+    Unit,
+    /// The main core's pump ([`crate::frmon_host::call_pump`]), called every pass.
+    Pump,
 }
 
 /// Read the demod's C/N (0.001 dB) over the host face, for a live level during cold
 /// streaming. The C/N alone, one I2C transfer: the stream loop cannot pump the TS while it
 /// reads (about 5-10 ms a transfer), and the lock is not needed there.
-pub fn cold_cn(io: &Io, terrestrial: bool) -> Result<i32> {
+pub fn cold_cn(io: &Io, fe: FrontEnd, terrestrial: bool) -> Result<i32> {
     let mut bus = FjBus::new(io);
     let sys = if terrestrial {
         System::Terrestrial
     } else {
         System::Satellite
     };
-    fe1::read_cn(&mut bus, sys).map(|(_, cn_mdb)| cn_mdb)
+    fe1::read_cn(&mut bus, fe, sys).map(|(_, cn_mdb)| cn_mdb)
 }
 
 /// A general host-face I2C transfer (write `wb`, then read `rb`) with the corrected
@@ -814,12 +1037,51 @@ impl fe1::Bus for FjBus<'_, '_> {
     }
 }
 
+/// [`FjBus`] that takes the I/O for each I2C transfer and gives it back, so a tune (1-2 s,
+/// mostly sleeps) does not hold up the stream of the unit's other tuner. Each transfer is
+/// whole under the lock (a tuner's write through its demod's gateway is one transfer).
+#[allow(missing_debug_implementations)]
+pub struct LockedBus<'l, L> {
+    l: &'l L,
+    wedged: bool,
+}
+
+impl<'l, L: IoAccess> LockedBus<'l, L> {
+    pub fn new(l: &'l L) -> Self {
+        Self { l, wedged: false }
+    }
+}
+
+impl<L: IoAccess> fe1::Bus for LockedBus<'_, L> {
+    fn i2c_write(&mut self, slave: u8, data: &[u8]) -> Result<()> {
+        let r = self.l.with_io(|io| xfer2(io, slave >> 1, data, &mut []));
+        if r.is_err() {
+            self.wedged = true;
+        }
+        r
+    }
+    fn i2c_write_read(&mut self, slave: u8, wdata: &[u8], rbuf: &mut [u8]) -> Result<()> {
+        let r = self.l.with_io(|io| xfer2(io, slave >> 1, wdata, rbuf));
+        if r.is_err() {
+            self.wedged = true;
+        }
+        r
+    }
+    fn sleep_ms(&mut self, ms: u64) {
+        std::thread::sleep(std::time::Duration::from_millis(ms));
+    }
+    fn wedged(&self) -> bool {
+        self.wedged
+    }
+}
+
 /// Blob-free COLD tune: bring the front end up ([`board_up`]), then run fe1's captured
 /// front-end init + tune over the host face and read the lock / C/N. No resident, no aux
 /// core, no vendor firmware. `restore` puts the board registers back afterwards, which holds
 /// the front end in reset again.
 pub fn cold_tune(
     io: &Io,
+    fe: FrontEnd,
     terrestrial: bool,
     freq_hz: u32,
     tsid: Option<u16>,
@@ -835,17 +1097,22 @@ pub fn cold_tune(
             r(io, O_DIVIDER)?
         ));
         let mut bus = FjBus::new(io);
-        fe1::power_on_init(&mut bus)?;
+        fe1::power_on(&mut bus, fe)?;
         log.push("front-end init done".into());
         let sys = if terrestrial {
-            fe1::tune_t(&mut bus, freq_hz)?;
+            fe1::tune_t(&mut bus, fe, freq_hz)?;
             System::Terrestrial
         } else {
-            let got = fe1::tune_s(&mut bus, freq_hz, tsid.unwrap_or(dt295_core::chan::NO_TSID))?;
+            let got = fe1::tune_s(
+                &mut bus,
+                fe,
+                freq_hz,
+                tsid.unwrap_or(dt295_core::chan::NO_TSID),
+            )?;
             log.push(format!("tune_s selected TSID {got:?}"));
             System::Satellite
         };
-        let st: Status = fe1::read_status(&mut bus, sys)?;
+        let st: Status = fe1::read_status(&mut bus, fe, sys)?;
         log.push(format!(
             "status: locked={} C/N={}.{:03} dB raw=0x{:06x}",
             st.locked,

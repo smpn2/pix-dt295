@@ -4,6 +4,8 @@
 //!   ([`Device::tune_t`] / [`Device::tune_s`]), and stream one service or every
 //!   service of the TS as descrambled, link-decrypted MPEG-TS
 //!   ([`Device::stream_start`]) on the System1 path (trc firmware, EP 0x81).
+//! * [`Tuner2`] -- a two-tuner model's second tuner ([`Device::tuner2`]): the whole TS,
+//!   descrambled, on the System2 path (EP 0x86), beside the first tuner's stream.
 //! * [`ts`] -- pure TS / PSI logic (CRC, PAT checks, link decryption, the
 //!   satellite PSI keeper, stream statistics); no device I/O, unit-tested.
 //! * [`state`] -- the host's persistent state file (link key, PSI).
@@ -28,28 +30,34 @@ mod cas;
 mod device;
 mod dtvdec;
 mod fw;
+mod raw;
 mod s1;
+mod s2;
 mod watch;
 
 pub use device::{Device, KeyJournal, Live};
 pub use dt295_core::fwdl::{IDLE_FIRMWARE, TRC_FIRMWARE};
 pub use dt295_core::{
-    Error, Result, Status, System, TsSink, bonini, chan, error, ipc, profile, serve,
+    Error, Model, Result, Status, System, TsSink, bonini, chan, error, ipc, profile, serve,
 };
 pub use dt295_rawfw::{RAW_FIRST_TS, RAW_STALL, RAW_STREAM_CAP, RawCaptureStats, raw_stall_due};
 pub use dt295_usb::Listed;
+pub use s2::Tuner2;
 pub use watch::{CardWatch, StallWatch, StartOver};
 
-/// The present PIX-DT295 units with their USB serial numbers, in the order
+/// The present units (every [`Model`]) with their USB serial numbers, in the order
 /// [`Device::open`] counts them; each is opened and closed again (no transfers) to
 /// tell whether it is free.
 pub fn list() -> Result<Vec<Listed>> {
-    Ok(dt295_usb::list(dt295_usb::VID, dt295_usb::PID)?)
+    Ok(dt295_usb::list(dt295_usb::VID, &dt295_usb::PIDS)?)
 }
 
-/// The USB serial numbers of the present PIX-DT295 units, without opening any.
+/// The USB serial numbers of the present units (every [`Model`]), without opening any.
 pub fn present_serials() -> Result<Vec<String>> {
-    Ok(dt295_usb::present_serials(dt295_usb::VID, dt295_usb::PID)?)
+    Ok(dt295_usb::present_serials(
+        dt295_usb::VID,
+        &dt295_usb::PIDS,
+    )?)
 }
 
 /// One cached satellite PSI section ([`Device::psi_export`] / [`Device::psi_import`]).

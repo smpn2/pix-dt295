@@ -1,27 +1,33 @@
-//! Blob-free COLD raw-TS stream for the BonDriver worker.
+//! Blob-free COLD raw-TS stream worker.
 //!
-//! [`run_cold_stream`] brings the chip up from cold, tunes and arms the capture engine over
-//! the host face (no resident, no aux core, no vendor firmware; see
-//! [`crate::fjcore::cold_prepare_stream`]), then pumps the on-chip ring to EP 0x81 with our
-//! own monitor pump and reframes the bytes into 188-byte TS packets for the sink, until
-//! stopped. The whole capture runs on the calling thread inside one `with_io`, so the device
-//! has a single owner and no locking is needed. The scrambled TS is passed through untouched,
-//! to be descrambled by host software with a real card.
+//! [`run_cold_stream`] brings the chip up from cold, tunes and arms the front end's capture
+//! over the host face (no resident and no vendor firmware; see
+//! [`crate::fjcore::cold_prepare_stream`]). The on-chip ring goes to the capture's endpoint
+//! (EP 0x81, or EP 0x86 for a two-tuner model's second tuner) through a unit's output
+//! path ([`crate::hwpath`]), or failing that through our own monitor pump, and the worker
+//! reframes the bytes into 188-byte TS packets for the sink, until stopped. The scrambled
+//! TS is passed through untouched, to be descrambled by host software with a real card;
+//! only the null packets are dropped.
+//!
+//! The worker takes the device I/O for one operation at a time ([`IoAccess`]): a pump call,
+//! an I2C transfer of a tune or a C/N read, the capture start. So the workers of a
+//! two-tuner model's two tuners share the unit and stream at once. The bulk IN reads need
+//! no lock.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use tracing::{info, warn};
 
-use crate::frmon_host::MonitorResident;
-use dt295_core::EP_TS;
-use dt295_core::proto::Io;
+use crate::IoAccess;
+use crate::fjcore::{Capture, Feed};
+use dt295_core::fe1::FrontEnd;
 use dt295_core::{Error, Result, TsSink};
 
-/// One EP 0x81 read buffer: 60 KiB, a multiple of the 512-byte bulk packet (the fallback
+/// One EP read buffer: 60 KiB, a multiple of the 512-byte bulk packet (the fallback
 /// single-read path).
 const BULK_READ_BYTES: usize = 61_440;
-/// Reads kept posted on EP 0x81.
+/// Reads kept posted on the EP.
 ///
 /// WinUSB: 48 x 64 KiB = 3 MiB, about 0.6 s of a full CS transponder. They complete in
 /// hardware (RAW_IO), so the EP keeps draining while the stream thread is held up (a C/N
@@ -37,10 +43,10 @@ const RQ_N: usize = cfg_select! {
     _ => 8,
 };
 const RQ_SIZE: usize = 0x10000;
-/// How long to wait for the next EP 0x81 chunk; also paces the pump.
+/// How long to wait for the next EP chunk; also paces the pump.
 const REAP_TIMEOUT: Duration = Duration::from_millis(1);
 
-/// How often the loop pumps the ring to EP 0x81.
+/// How often the loop pumps the ring to the EP.
 const PUMP_EVERY: Duration = Duration::from_millis(2);
 /// A full CS transponder, the fastest stream: about 4.9 MB/s (the demod drops the dummy
 /// slots, S reg 0x8E bit 1). BS and terrestrial streams are slower.
@@ -62,6 +68,9 @@ pub struct RawCaptureStats {
     pub bytes: u64,
     /// 188-byte packets emitted.
     pub packets: u64,
+    /// Null packets (PID 0x1FFF) dropped before the sink: the demodulator fills a terrestrial
+    /// TS with them, nearly half of its packets.
+    pub null_packets: u64,
     /// Continuity-counter gaps in the delivered TS: packets lost on the way (the on-chip
     /// ring overflowing while the pump came late), or one after a damaged packet (which is
     /// not checked, so the next packet on its PID shows a gap).
@@ -83,12 +92,18 @@ impl RawCaptureStats {
         self.cc_gaps > self.error_packets || self.max_pump_gap >= OVERFLOW_PUMP
     }
 
-    /// One line on the losses, for the logs.
+    /// One line on the losses, for the logs (the pump intervals only when a pump ran: the
+    /// unit's output path has none).
     fn loss_line(&self) -> String {
+        let packets = format!(
+            "{} continuity gaps, {} damaged packets",
+            self.cc_gaps, self.error_packets
+        );
+        if self.late_pumps == 0 && self.max_pump_gap.is_zero() {
+            return packets;
+        }
         format!(
-            "{} continuity gaps, {} damaged packets, {} late pumps (longest interval {} ms)",
-            self.cc_gaps,
-            self.error_packets,
+            "{packets}, {} late pumps (longest interval {} ms)",
             self.late_pumps,
             self.max_pump_gap.as_millis()
         )
@@ -208,7 +223,6 @@ struct CcCheck {
 
 impl CcCheck {
     const NONE: u8 = 0xff;
-    const NULL_PID: usize = 0x1fff;
 
     fn new() -> Self {
         CcCheck {
@@ -227,7 +241,7 @@ impl CcCheck {
             }
             let pid = (usize::from(p[1] & 0x1f) << 8) | usize::from(p[2]);
             let control = (p[3] >> 4) & 3;
-            if pid == Self::NULL_PID || control & 1 == 0 {
+            if pid == usize::from(dt295_core::ts::NULL_PID) || control & 1 == 0 {
                 continue; // null packets, and packets without payload: the counter does not count
             }
             let cc = p[3] & 0x0f;
@@ -243,15 +257,15 @@ impl CcCheck {
     }
 }
 
-/// Blob-free COLD raw-TS stream for the BonDriver worker: host bring-up + tune + capture arm
-/// (no resident, no aux core, no vendor firmware; [`crate::fjcore::cold_prepare_stream`]),
-/// then pump the ring to EP 0x81 and reframe to the sink until stopped. `full` does the
-/// one-time cold bring-up (the first tune after a re-plug / open); a channel change passes
-/// `full` = false and only retunes + rearms. `duration` is a safety cap; the worker runs
-/// until `stop`.
+/// Blob-free COLD raw-TS stream: host bring-up + tune + capture arm (no resident and no vendor
+/// firmware; [`crate::fjcore::cold_prepare_stream`]), then take the ring of `fe`'s capture to
+/// its EP (the unit's output path, or the pump) and reframe to the sink until stopped. `full` does the one-time cold
+/// bring-up (the first tune after a re-plug / open); a channel change passes `full` = false
+/// and only retunes + rearms. `duration` is a safety cap; the worker runs until `stop`.
 #[allow(clippy::too_many_arguments)]
-pub fn run_cold_stream(
-    io: &Io,
+pub fn run_cold_stream<L: IoAccess>(
+    l: &L,
+    fe: FrontEnd,
     terrestrial: bool,
     freq_hz: u32,
     tsid: Option<u16>,
@@ -261,7 +275,8 @@ pub fn run_cold_stream(
     sink: &mut TsSink,
     cn_report: Option<&dyn Fn(i32)>,
 ) -> Result<RawCaptureStats> {
-    let status = crate::fjcore::cold_prepare_stream(io, terrestrial, freq_hz, tsid, full)?;
+    let (status, feed) =
+        crate::fjcore::cold_prepare_stream(l, fe, terrestrial, freq_hz, tsid, full)?;
     let locked = status.locked;
     if locked && let Some(report) = cn_report {
         // The C/N of the lock, at once: the first periodic read is a second away, and the host
@@ -269,12 +284,14 @@ pub fn run_cold_stream(
         report(status.cn_mdb);
     }
     info!(
-        "raw-TS cold: {} at {:.3} MHz",
+        "raw-TS cold: tuner {} {} at {:.3} MHz",
+        fe.tuner() + 1,
         if locked { "locked" } else { "NO LOCK" },
         f64::from(freq_hz) / 1e6
     );
+    let cap = Capture::of(fe);
     let streamed = if locked {
-        pump_stream(io, terrestrial, duration, stop, sink, cn_report)
+        pump_stream(l, fe, terrestrial, feed, duration, stop, sink, cn_report)
     } else {
         // An unlocked demod produces no TS, so end now rather than pump an empty ring for
         // the host's whole first-TS timeout: an off-air / empty channel then reports no
@@ -284,7 +301,7 @@ pub fn run_cold_stream(
     // Stop the engine the arm started, so the next arm starts from a stopped one. Not after
     // an unplug: the device is gone.
     let unplugged = matches!(&streamed, Err(Error::State(why)) if why == UNPLUGGED);
-    if !unplugged && let Err(e) = crate::fjcore::stop_capture(io) {
+    if !unplugged && let Err(e) = l.with_io(|io| crate::fjcore::stop_capture(io, cap)) {
         warn!("raw-TS cold: capture stop: {e}");
     }
     streamed
@@ -292,17 +309,24 @@ pub fn run_cold_stream(
 
 const UNPLUGGED: &str = "device unplugged during cold stream";
 
-/// The stream loop of [`run_cold_stream`], once the demod has locked: pump the ring to EP
-/// 0x81 and reframe to the sink until `stop` (or `duration`).
-fn pump_stream(
-    io: &Io,
+/// The stream loop of [`run_cold_stream`], once the demod has locked: pump the ring to the
+/// capture's EP (unless the unit's output path feeds it) and reframe to the sink until `stop`
+/// (or `duration`).
+#[allow(clippy::too_many_arguments)]
+fn pump_stream<L: IoAccess>(
+    l: &L,
+    fe: FrontEnd,
     terrestrial: bool,
+    feed: Feed,
     duration: Duration,
     stop: Option<&AtomicBool>,
     sink: &mut TsSink,
     cn_report: Option<&dyn Fn(i32)>,
 ) -> Result<RawCaptureStats> {
-    let _ = io.usb.abort_pipe(EP_TS);
+    let cap = Capture::of(fe);
+    let ep = cap.ep();
+    let usb = l.usb();
+    let _ = usb.abort_pipe(ep);
     // Past the bring-up, from here on a late pump loses TS (the module doc of `prio`).
     match crate::prio::raise_stream_threads() {
         Ok(got) => info!("raw-TS cold: stream thread at {got}"),
@@ -310,8 +334,8 @@ fn pump_stream(
         // up at the normal priority. One that falls behind shows it in the loss reports below.
         Err(why) => info!("raw-TS cold: the stream keeps the normal priority ({why})"),
     }
-    let mut queue = io.usb.read_queue(EP_TS, RQ_N, RQ_SIZE).ok();
-    let mut rt = MonitorResident::new(io);
+    let mut queue = usb.read_queue(ep, RQ_N, RQ_SIZE).ok();
+    let mut seq = 0;
     let mut reframer = ColdReframer::new();
     let mut cc = CcCheck::new();
     let mut fallback = vec![0u8; BULK_READ_BYTES];
@@ -338,7 +362,7 @@ fn pump_stream(
         // between pumps (16 MB/s) is well above the ~5 MB/s of a full CS transponder, while
         // cutting the control-transfer traffic of pumping on every (sub-millisecond) loop
         // pass. Each interval is timed: one past what the ring holds (~0.85 s) loses TS.
-        if last_pump.elapsed() >= PUMP_EVERY {
+        if feed == Feed::Pump && last_pump.elapsed() >= PUMP_EVERY {
             let now = Instant::now();
             if let Some(prev) = pump_started {
                 let gap = now - prev;
@@ -358,7 +382,7 @@ fn pump_stream(
                 window_max_gap = window_max_gap.max(gap);
             }
             pump_started = Some(now);
-            let _ = rt.pump();
+            let _ = l.with_io(|io| crate::frmon_host::call_pump(io, cap.pump(), &mut seq));
             last_pump = Instant::now();
         }
         match queue.as_mut() {
@@ -373,7 +397,7 @@ fn pump_stream(
                 }
                 Err(e) => return Err(Error::Usb(e)),
             },
-            None => match io.usb.read(EP_TS, &mut fallback, REAP_TIMEOUT) {
+            None => match usb.read(ep, &mut fallback, REAP_TIMEOUT) {
                 Ok(n) if n > 0 => {
                     let got = fallback[..n].to_vec();
                     frame_chunk(&mut reframer, &mut cc, sink, &got, &mut out, &mut stats);
@@ -390,7 +414,7 @@ fn pump_stream(
             && last_cn.elapsed() >= CN_INTERVAL
         {
             last_cn = Instant::now();
-            if let Ok(cn_mdb) = crate::fjcore::cold_cn(io, terrestrial) {
+            if let Ok(cn_mdb) = l.with_io(|io| crate::fjcore::cold_cn(io, fe, terrestrial)) {
                 report(cn_mdb);
             }
         }
@@ -415,11 +439,17 @@ fn pump_stream(
             last_report = Instant::now();
         }
     }
+    if feed == Feed::Unit
+        && let Some(q) = queue.as_mut()
+    {
+        settle(l, cap, q);
+    }
     stats.packets = stats.bytes / TS_PACKET as u64;
     let summary = format!(
-        "raw-TS cold: streamed {:.1} s, {} packets: {}",
+        "raw-TS cold: streamed {:.1} s, {} packets ({} null packets dropped): {}",
         start.elapsed().as_secs_f64(),
         stats.packets,
+        stats.null_packets,
         stats.loss_line()
     );
     if stats.lossy() {
@@ -428,6 +458,28 @@ fn pump_stream(
         info!("{summary}");
     }
     Ok(stats)
+}
+
+/// Longest wait for the endpoint to go quiet at a stream's end, and the quiet that counts.
+const SETTLE_MAX: Duration = Duration::from_millis(200);
+const SETTLE_QUIET: Duration = Duration::from_millis(20);
+
+/// At the end of a stream on the unit's output path: stop the feeder and read off what it
+/// already sent (discarded) before the posted reads are cancelled. On a Linux EHCI host,
+/// cancelling reads while the endpoint still sends cost a few packets of another unit's
+/// stream (a few CC gaps there when this one stops); the pump's endpoint is idle by then.
+fn settle<L: IoAccess>(l: &L, cap: Capture, q: &mut dt295_usb::ReadQueue<'_>) {
+    if let Err(e) = l.with_io(|io| crate::hwpath::pause(io, cap)) {
+        warn!("raw-TS cold: unit path pause: {e}");
+        return;
+    }
+    let started = Instant::now();
+    let mut last = Instant::now();
+    while started.elapsed() < SETTLE_MAX && last.elapsed() < SETTLE_QUIET {
+        if let Ok(Some(_)) = q.next(REAP_TIMEOUT) {
+            last = Instant::now();
+        }
+    }
 }
 
 static RAW_DUMPED: AtomicBool = AtomicBool::new(false);
@@ -469,7 +521,8 @@ fn raw_dump_once(data: &[u8]) {
 }
 
 /// Reframe one bulk chunk into 188-byte packets, check their continuity and forward them
-/// to the sink.
+/// to the sink without the null packets, which carry nothing (the counters are checked
+/// first, so a damaged packet is counted whatever PID it reads).
 fn frame_chunk(
     reframer: &mut ColdReframer,
     cc: &mut CcCheck,
@@ -483,6 +536,11 @@ fn frame_chunk(
     reframer.feed(data, out);
     if !out.is_empty() {
         cc.check(out, stats);
+        let kept = dt295_core::ts::drop_null(out);
+        stats.null_packets += ((out.len() - kept) / TS_PACKET) as u64;
+        out.truncate(kept);
+    }
+    if !out.is_empty() {
         sink(out);
         stats.bytes += out.len() as u64;
     }

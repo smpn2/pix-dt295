@@ -7,7 +7,7 @@
 
 - 実装は Rust (`src/`、Cargo workspace、edition 2024、resolver 3)
 - 視聴に使うのは System1 の経路 (trc ファームウェア + EP 0x81)。
-  System2 (EP 0x86) は実装していない。
+  2 チューナーの機種 (PIX-DT295W、PIX-DT195W) の 2 つ目のチューナーのみ System2 の経路 (EP 0x86) を使う (下の "2 チューナーの機種" セクション)。
 - 大きい未解決の課題は CS ND08 の視聴中のドロップ (下の "未解決の課題" セクション)
 - 個体を開くのは `dt295 serve` (デーモン) で、BonDriver はそのクライアント (下の "BonDriver と `dt295 serve`" セクション)。
   ほかの `dt295` のコマンド (`capture`, `logo` など) は、デーモンが開いていない個体を自分で開く。
@@ -19,18 +19,19 @@
 |---|---|---|
 | `src/dt295-usb` | lib | USB アクセス。Windows は windows-sys で WinUSB を直接、Linux は nusb |
 | `src/dt295-chdef` | lib | デバイスに依存しないチャンネル定義。設定ファイルの文字コード, Win32 のプロファイル API と同じ ini の読み方, C の数値の書式, 地デジと BS / CS110 の周波数の表 |
-| `src/dt295-core` | lib | ハードウェアの土台。レジスターとコマンドのプロトコル, I2C, フロントエンド (選局, ロック待ち, C/N), チャンネル表, ファームウェアの転送, `dt295 serve` とクライアントの要求と応答 (`serve`) とソケット (`ipc`), 共有する型 (`System` / `Status` / `TsSink`) |
+| `src/dt295-core` | lib | ハードウェアの土台。機種, レジスターとコマンドのプロトコル, I2C, フロントエンド (選局, ロック待ち, C/N), チャンネル表, ファームウェアの転送, `dt295 serve` とクライアントの要求と応答 (`serve`) とソケット (`ipc`), 共有する型 (`System` / `Status` / `TsSink`) |
 | `src/dt295-rawfw` | lib | 自前コードのみの raw-TS 経路 ([raw-ts.md](raw-ts.md))。cold stream の worker, FR monitor のホスト側, ホスト面の demod I2C。`dt295-core` の上に乗る |
 | `src/dt295-frmon` | lib | 自前の boot0 monitor (FR CPU) と、必要な FR 命令の小さな assembler (オンチップのコードのビルドと確認に使う) |
-| `src/dt295` | lib | ドライバーのコア (認証, System1 ストリーム, ファームウェアの起動), I/O の無い TS 処理, 状態ファイル。`dt295-core` と `dt295-rawfw` の公開 API を re-export する |
+| `src/dt295` | lib | ドライバーのコア (認証, System1 と System2 のストリーム, ファームウェアの起動), I/O の無い TS 処理, 状態ファイル。`dt295-core` と `dt295-rawfw` の公開 API を re-export する |
 | `src/dt295-bondriver` | cdylib | `BonDriver_DT295.dll` (中身は Rust, `IBonDriver2` は C++ の薄い shim)。`dt295 serve` のクライアント。`bontest` と見本の ini もここ |
 | `src/dt295-cli` | bin | `dt295` のサブコマンド (デーモンの `serve` と、そのクライアントの `tune` も) |
 
 | ファイル | 役割 |
 |---|---|
-| `dt295-usb/src/` | 制御, バルク, 割り込み転送, EP 0x81 の読み出しキュー `ReadQueue`, 個体の一覧 |
+| `dt295-usb/src/` | 制御, バルク, 割り込み転送, バルク IN の読み出しキュー `ReadQueue`, 個体の一覧 (4 つの機種の PID) |
+| `dt295-core/src/model.rs` | 機種 (`Model`: PID からの判定, チューナーの数) |
 | `dt295-core/src/{proto,fwdl}.rs` | レジスター, doorbell, コマンドと ACK 待ち, ファームウェアの転送 |
-| `dt295-core/src/{i2c,fe1,signal}.rs` | I2C, フロントエンド (選局, ロック待ち, C/N) |
+| `dt295-core/src/{i2c,fe1,signal}.rs` | I2C, フロントエンド (選局, ロック待ち, C/N)。`fe1::FrontEnd` が復調のどの組か (2 チューナーの機種は 2 組) と、TS の出力 (`Port`) を表す |
 | `dt295-chdef/src/{text,profile,num,plan}.rs` | 設定ファイルの文字コード, Win32 のプロファイル API と同じ ini の読み方, C の数値の書式, 地デジのチャンネル表と BS / CS110 の周波数の表 (BonDriver と `dt295` が共有) |
 | `dt295-chdef/src/{bda,chset,px}.rs` | ほかの BonDriver のチャンネル定義ファイル (`[Tuner] ChannelFile`): BonDriver_BDA の ini, PT の ChSet.txt, BonDriver_PX シリーズの ini を、そのドライバーと同じ読み方と番号の振り方で読む |
 | `dt295-core/src/{chan,bonini}.rs` | TSID からのトランスポンダー, 衛星の ini の行, ini のチューニング空間, ini の `[Tuner]` (個体, raw-TS, ほかの BonDriver のチャンネル定義。ファームウェアと状態ファイルは ini のフォルダーのもの) |
@@ -40,12 +41,14 @@
 | `dt295/src/{device,fw}.rs` | 公開 API `Device`, ファームウェアの起動と残った状態からの回復, ほかのスレッド向けの `Live` (ストリーム中の C/N など) |
 | `dt295/src/{auth,cas,dtvdec}.rs` | 起動時の認証, セキュアセッション (keepalive, B-CAS の第 2 段), リンク鍵 |
 | `dt295/src/s1/` | System1 ストリームと worker (下の "仕組み" セクション)。`decoder_init.bin` は純正の初期化のキャプチャで、手で編集しない |
+| `dt295/src/s2.rs` | 2 チューナーの機種の 2 つ目のチューナー (`Tuner2`): 選局と System2 ストリームの worker, raw-TS のストリームの開始と停止 |
+| `dt295/src/raw.rs` | raw-TS のストリームの worker (`Device` と `Tuner2` が共有) |
 | `dt295/src/ts/` | I/O の無い TS 処理 (PAT, PMT, セクションの組み立て, リンク暗号, PSI keeper, 全サービスのルート `route.rs` など)。単体テストの大半はここ |
 | `dt295/src/{state,watch}.rs` | 状態ファイルと、リンク鍵と PSI のキャッシュの扱いの規則 (`dt295 serve` と `dt295` のほかのコマンドが共有), ストリームを始め直すかの判断 (`CardWatch`: B-CAS カードと止まったファームウェア、後者のみなら `StallWatch`) |
 | `dt295-bondriver/src/{ffi,driver}.rs`, `cpp/` | `CreateBonDriver` と shim。`IBonDriver2` の中身 (チューニング空間, 選局の要求, TS の FIFO, raw-TS の prime) |
 | `dt295-bondriver/src/{config,client,fifo,logging}.rs` | ini の読み込み (ログの設定と DLL の名前から決まるパス), `dt295 serve` のクライアント (起動, 選局の要求, C/N の問い合わせ, ストリームの回復), TS の FIFO, ログ |
-| `dt295-cli/src/` | サブコマンドごとのファイル。`tuner.rs` は `capture`, `logo`, `serve` が共有する個体の起動と停止の合図, `rawts.rs` は `capture` と `serve` が共有する raw-TS の開始と最初の TS の待ち, `bonini.rs`, `ch2.rs`, `sections.rs` は ini, .ch2, TS のパケットの読み取り |
-| `dt295-cli/src/serve/`, `tune.rs` | `dt295 serve` と `dt295 tune` (Linux と Windows)。`conf` は設定ファイルと接続先, `unit.rs` は個体のスレッド |
+| `dt295-cli/src/` | サブコマンドごとのファイル。`tuner.rs` は `capture`, `logo`, `serve` が共有する個体の起動と停止の合図, `rawts.rs` は `capture` と `serve` が共有する raw-TS の開始と最初の TS の待ち (どちらのチューナーにも使う `RawTuner`), `bonini.rs`, `ch2.rs`, `sections.rs` は ini, .ch2, TS のパケットの読み取り |
+| `dt295-cli/src/serve/`, `tune.rs` | `dt295 serve` と `dt295 tune` (Linux と Windows)。`conf` は設定ファイルと接続先, `unit.rs` は個体のスレッド, `tuner2.rs` は 2 チューナーの機種の 2 つ目のチューナーのスレッド, `raw.rs` は両方のスレッドが使う raw-TS のストリーム |
 | `packaging/arch/` | Arch Linux のパッケージ (PKGBUILD と makepkg の install スクリプト) |
 | `packaging/linux/` | パッケージが共有する systemd のユニット, sysusers, tmpfiles, udev のルール |
 | `packaging/nfpm/` | リリースの deb, rpm, Arch Linux のパッケージ (nfpm の設定と、インストール, 削除のときのスクリプト) |
@@ -57,8 +60,8 @@
 
 設計上の決まり:
 
-- System2 の経路 (EP 0x86, trc ファームウェアなし) は無い。
-  trc ファームウェアが無いとストリームは始まらない。
+- 1 つ目のチューナーは System1 の経路のみで、trc ファームウェアが無いとストリームは始まらない。
+  System2 の経路 (EP 0x86, trc ファームウェアなし) は 2 チューナーの機種の 2 つ目のチューナー専用。
 - BonDriver は個体を開かない。
   個体は `dt295 serve` の個体ごとのスレッドが持ち、BonDriver はソケットで選局を頼んで TS を受け取る。
 - ストリーム中にデバイスと I/O するのは worker のみ。
@@ -311,6 +314,41 @@ BonDriver は 1 秒ごとに `status` を問い合わせ、`GetSignalLevel` は�
   パイプの種類を `GetNamedPipeInfo` で調べられないとき (送信専用の名前付きパイプのサーバー側など) は、バイトモードとして扱う。
 - カードの抜き挿しやファームウェアの停止で始め直すときは、同じクライアントへの送信を継続
 - 再初期化の判定に使う「デバイスが出した量」は `Live::delivered` で、PAT を待つ間に捨てた分も入る
+- 2 チューナーの機種の 2 つ目のチューナー (`tuner=2`) は別のスレッド (`serve/tuner2.rs`) が受け持つ。
+  個体のスレッドを作るときに一緒に作る。
+  個体のスレッドは個体を開いて起動した後 (raw-TS の個体は開いた後) に `Device::tuner2` を `Slot` に貸し出し、個体を閉じる前に返してもらう (`Tuner2` も USB のハンドルを持つため)。
+  2 つ目のチューナーは個体を開いた経路で動き、別の経路の要求には `error` を返す。
+  個体を開く前に来た要求は、貸し出されるまで最大 15 秒待つ (2 つ目のチューナーの要求で個体のスレッドを作ったときも)。
+  System1 の経路では、2 つ目のチューナーのストリームが 10 秒間何も届けなければ (個体のスレッドが起動し直したときなど) 選局からやり直し、個体のスレッドはアイドル中に止まったファームウェアを起動し直す。
+- 2 つ目のチューナーのスレッドも、要求の処理中かとストリームの C/N を公開する (`unit::Info`)。
+  `--idle-exit` は両方のスレッドを見て、`status` は要求の `tuner` のものを答える。
+- 2 つ目のチューナーのストリームも、panic のときは `unit::Streaming` と `unit::Busy` で片付ける (raw-TS の `serve/raw.rs` も)。
+  借りた `Tuner2` は `tuner2::Lent` が持ち、unwind ではストリームを止めてから `Slot` に返す。
+  `tuner=2` の要求のときに 2 つ目のチューナーのスレッドが終わっていれば、そのスレッドだけを作り直す (`Units::start_tuner2`)。
+  新しいスレッドは同じ `Slot` から借りる。
+- 個体のスレッドが panic したときは、unwind で 2 つ目のチューナーを返してもらう (`Unit` の `Drop`)。
+  2 つ目のチューナーのストリームも終わり、`Tuner2` が USB のハンドルを放して個体が閉じる。
+  個体のスレッドを作り直すときは、2 つ目のチューナーのスレッドも新しい `Slot` で作り直す。
+  前のスレッドは、要求のチャンネルが無くなって終わる。
+
+### 2 チューナーの機種
+
+仕様は [device.md](device.md) の "PIX-DT195W" と "TS ストリーム (System2 / EP 0x86)" セクション。
+
+- `Device` は個体を受け持つ (起動, 認証, カードのセッション, keepalive, 回復) とともに、1 つ目のチューナー (System1) を扱う
+- 2 つ目のチューナーは `Device::tuner2` が返す `Tuner2` (1 つの `Device` に 1 つ) で、`Device` と USB のハンドルとデバイスの状態のロックを共有する。
+  起動の回数 (`State::boot_gen`) で、選局の後に個体が起動し直したかが分かる (ストリームの開始は失敗し、選局からやり直す)。
+- `Tuner2` の選局は I2C の転送ごとにロックを取る (`LockBus`)。
+  選局 (1-2 秒) の間、1 つ目のチューナーの worker を待たせないため。
+  2 つ目の worker は EP 0x86 を読み、ロックが空いていれば毎秒 C/N を読んで keepalive を送る (`try_lock`。1 つ目の worker を待たせない)。
+- カードのセッション (B-CAS の第 2 段) は起動ごとに 1 回で、どちらのチューナーの最初のストリームでも開く (`State::card_open`)。
+  アイドル中の keepalive も、どちらかのストリームがセッションを始めた後から送る。
+- `Device::set_tuner(1)` は、2 つ目のチューナーの TS を出力 A に出して 1 つ目の経路 (System1 と raw-TS の 1 つ目の取り込み) で受ける。
+  `dt295 capture --tuner 2 --raw-ts` で使う。
+- raw-TS では、2 つ目のチューナーは `Tuner2::stream_start_cold` で出力 B からチップの 2 つ目の取り込みを通り、1 つ目と同時に流す ([raw-ts.md](raw-ts.md) の "2 チューナーの機種" セクション)。
+  `dt295 serve` の raw-TS の個体でも、2 つ目のチューナーは別のスレッドが受け持つ。
+- Windows の TVTest は 1 プロセスに 1 つの BonDriver を読み込み、USB の個体を開けるのは 1 プロセスのみ。
+  BonDriver は個体を `dt295 serve` に任せるので、2 つの TVTest (`TunerNumber` の違う DLL) で 2 つのチューナーを同時に使える。
 
 ### BonDriver と `dt295 serve`
 
@@ -322,7 +360,7 @@ BonDriver の中身は `dt295 serve` のクライアント (`client.rs`)。
   引数は `--socket` (か `--listen`), `--idle-exit` (`[Server] IdleExitSec`), `--firmware-dir` と `--state-dir` (どちらも DLL のフォルダー)、`LogLevel` が `debug` か `trace` なら `-v` か `-vv`。
   起動した `dt295 serve` には 100 ms ごとに問い合わせ、応答するか、終了するか (別の DLL が起動したデーモンが先に待ち受けたときなど)、`[Server] StartTimeoutSec` が過ぎるまで待つ。
   応答せずに接続を閉じられたら (終了中のデーモン)、100 ms ごとに 1 秒まで問い合わせ直し、待ち受けが無くなれば起動する。
-- 要求には `client=<プロセス ID>-<モジュール>-<番号>` と `if-free`、`mode` (`RawTS`)、`DeviceSerial` があれば `unit` を付ける。
+- 要求には `client=<プロセス ID>-<モジュール>-<番号>` と `if-free`、`mode` (`RawTS`)、`DeviceSerial` があれば `unit`、`TunerNumber=2` なら `tuner=2` を付ける (`status` にも)。
   `<モジュール>` は DLL の static のアドレスで、名前を変えた DLL を 1 つのプロセスで開いたとき (BonDriverProxyEx など) にも、別のクライアントになる。
 - 監視のスレッドが 1 秒ごとに `status` を送り、C/N を更新する (`dt295 serve` はメインのスレッドで答えるので、選局中でも待たない)。
   ストリームが終わっていたか (読み取りのスレッドが相手の切断を見た)、デーモンが応答しなければ、デーモンを起動し直して同じチャンネルを要求し直す。
@@ -380,7 +418,7 @@ BonDriver が起動した `dt295 serve` のログは、DLL のフォルダーの
 
 - BonDriver の選局ごと: `SetChannel(<空間>, <チャンネル>) <名前> <MHz> MHz: streaming, C/N ... dB (... ms)`、失敗したら `streaming` の代わりに理由
 - `dt295 serve` の選局ごと: `tune ...: streaming (... ms)`、ストリームの終わりに `stream ended after ... s (<理由>): ... bytes`
-- ストリームの停止時 (`dt295 serve`): `s1 worker: delivered N bytes, P PAT(s), ...` と `s1 worker: N read(s) (M full 64K), longest gap ... ms; K continuity error(s) in the device's TS...; T TEI packet(s)`
+- ストリームの停止時 (`dt295 serve`): `s1 worker: received N bytes (K null packets left out), P PAT(s), ...` と `s1 worker: N read(s) (M full 64K), longest gap ... ms; K continuity error(s) in the device's TS...; T TEI packet(s)`
 - 異常 (連続性エラー、TEI、100 ms を超える読み出しの間隔、復調の誤り、アンロック) のあった分のみ: `s1 stats min N: ... continuity error(s) on PID ..., TEI ..., error seconds: ..., longest gap ... ms, ... MB; demod C/N ..., err 0xEB sum ... max ..., 0xF0 sum ... max ...`
 - 衛星のストリームの停止時: `psi: TS xxxx -- re-sent PAT xN, PMT xN, SDT xN, NIT xN | cache: ...`
 

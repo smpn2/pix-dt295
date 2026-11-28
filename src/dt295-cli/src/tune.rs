@@ -23,6 +23,10 @@ pub struct TuneArgs {
     #[arg(long, alias = "unit", value_name = "SERIAL")]
     pub serial: Option<String>,
 
+    /// The tuner of the unit: 1, or 2 on a two-tuner model (its streams run beside tuner 1's).
+    #[arg(long, value_name = "N", default_value_t = 1, value_parser = clap::value_parser!(u8).range(1..=2))]
+    pub tuner: u8,
+
     /// ISDB-T: the channel centre frequency in Hz (e.g. 557142857 for UHF 27ch).
     #[arg(long, value_name = "HZ", value_parser = parse_u32)]
     pub ter: Option<u32>,
@@ -42,9 +46,9 @@ pub struct TuneArgs {
     #[arg(long, value_name = "ID", value_parser = parse_u16)]
     pub sid: Option<u16>,
 
-    /// Only if the unit is free: fail instead of taking it over from a running stream
+    /// Only if the tuner is free: fail instead of taking it over from a running stream
     /// (for background jobs such as `dt295 logo`; a recorder's request still takes the
-    /// unit over from this one).
+    /// tuner over from this one).
     #[arg(long)]
     pub if_free: bool,
 
@@ -83,6 +87,7 @@ pub fn run(a: &TuneArgs) -> Result<()> {
     )?;
     let req = Request {
         unit: a.serial.clone().unwrap_or_default(),
+        tuner: a.tuner,
         tuning,
         sid: a.sid,
         mode: None,

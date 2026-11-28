@@ -1,7 +1,7 @@
 //! PIX-DT295 hardware primitives and shared types.
 //!
-//! This crate holds the low-level pieces the rest of the driver builds on: the
-//! register / command protocol over USB ([`proto`]), the type-9 I2C transport
+//! This crate holds the low-level pieces the rest of the driver builds on: the models
+//! ([`model`]), the register / command protocol over USB ([`proto`]), the type-9 I2C transport
 //! ([`i2c`]), the System1 front end ([`fe1`]), the channel tables and tuning spaces
 //! ([`chan`]), the ini rules of the Win32 profile API ([`profile`], from `dt295-chdef`)
 //! and the BonDriver ini's `[Tuner]` ([`bonini`]), the C/N conversions ([`signal`]), the firmware
@@ -18,12 +18,15 @@ pub mod fe1;
 pub mod fwdl;
 pub mod i2c;
 pub mod ipc;
+pub mod model;
 pub mod proto;
 pub mod serve;
 pub mod signal;
+pub mod ts;
 
 pub use dt295_chdef::profile;
 pub use error::{Error, Result};
+pub use model::Model;
 
 /// The TS bulk endpoint (EP 0x81) of the System1 and raw-TS data paths.
 pub const EP_TS: u8 = 0x81;

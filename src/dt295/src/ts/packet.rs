@@ -5,12 +5,10 @@
 //! [`NULL_PID`], flags clear), which every caller ignores, so a truncated packet can
 //! never cause a panic.
 
-/// TS packet size.
-pub const PACKET: usize = 188;
+/// TS packet size, and the NULL packet PID (one definition, in `dt295-core`).
+pub use dt295_core::ts::{NULL_PID, PACKET};
 /// Sync byte.
 pub const SYNC: u8 = 0x47;
-/// The NULL packet PID.
-pub const NULL_PID: u16 = 0x1FFF;
 
 /// Packets in a row that must start with the sync byte for [`find_sync`] to lock.
 const SYNC_RUN: usize = 4;

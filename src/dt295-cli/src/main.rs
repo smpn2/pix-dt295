@@ -59,7 +59,8 @@ enum Command {
     /// Boot the device, tune, and write the TS (every service, or the one of --sid) to a
     /// file or stdout; with --raw-ts the scrambled TS, booting nothing.
     Capture(CaptureArgs),
-    /// List the connected PIX-DT295 units: index, USB serial number, whether free.
+    /// List the connected units (PIX-DT295(W), PIX-DT195(W)): index, USB serial number, model,
+    /// whether free.
     List,
     /// Inspect a state file (dt295 serve's <serial>.state, or an older BonDriver_DT295.state).
     State {

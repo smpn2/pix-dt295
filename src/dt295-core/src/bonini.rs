@@ -1,6 +1,6 @@
 //! The `[Tuner]` section of a `BonDriver_DT295.ini` as the BonDriver reads it, shared
-//! with the `dt295` command, which takes the same file as its configuration: the unit,
-//! the raw-TS switch and the channel file of another BonDriver. The unit's firmware and
+//! with the `dt295` command, which takes the same file as its configuration: the unit and
+//! its tuner, the raw-TS switch and the channel file of another BonDriver. The unit's firmware and
 //! state file are in the ini's folder, where the `dt295 serve` the BonDriver starts keeps
 //! them. Relative paths are under the ini's folder. The tuning spaces of the file are
 //! [`chan::ini_spaces`](crate::chan::ini_spaces).
@@ -43,6 +43,9 @@ pub struct Tuner {
     pub dir: PathBuf,
     /// `DeviceSerial` (blanks trimmed, upper case); `None` = the only unit connected.
     pub serial: Option<String>,
+    /// `TunerNumber`: the tuner of the unit, 1 (absent, or anything but 2) or 2 (a
+    /// two-tuner model's second).
+    pub tuner_number: u8,
     /// `RawTS`: non-zero = the blob-free raw-TS path (absent = the System1 path).
     pub raw_ts: bool,
     /// `ChannelFile`: the channel file of another BonDriver whose tuning spaces to list
@@ -63,6 +66,11 @@ impl Tuner {
         Self {
             dir: dir.to_owned(),
             serial: (!serial.is_empty()).then(|| serial.to_ascii_uppercase()),
+            tuner_number: if profile::get_int(ini, "Tuner", "TunerNumber", 1) == 2 {
+                2
+            } else {
+                1
+            },
             raw_ts: profile::get_int(ini, "Tuner", "RawTS", 0) != 0,
             channel_file,
         }
@@ -140,8 +148,17 @@ mod tests {
         );
         assert_eq!(t.serial, None);
         assert_eq!(t.state_file("cd23456789"), dir().join("CD23456789.state"));
+        assert_eq!(t.tuner_number, 1);
         assert!(!t.raw_ts);
         assert_eq!(t.channel_file, None);
+    }
+
+    #[test]
+    fn the_tuner() {
+        assert_eq!(tuner("[Tuner]\nTunerNumber=2\n").tuner_number, 2);
+        assert_eq!(tuner("[Tuner]\nTunerNumber=1\n").tuner_number, 1);
+        assert_eq!(tuner("[Tuner]\nTunerNumber=3\n").tuner_number, 1);
+        assert_eq!(tuner("[Tuner]\nTunerNumber=\n").tuner_number, 1);
     }
 
     #[test]

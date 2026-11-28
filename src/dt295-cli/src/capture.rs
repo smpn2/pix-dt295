@@ -205,6 +205,7 @@ fn conf_device_args(conf: &Conf, given: &DeviceArgs) -> Result<(DeviceArgs, bool
         fw: given.fw.clone().or_else(|| Some(conf.idle_firmware())),
         trc: given.trc.clone().or_else(|| Some(conf.trc_firmware())),
         index: 0,
+        tuner: given.tuner,
         state: given
             .state
             .clone()
@@ -312,6 +313,52 @@ fn capture_system1(
     }
     let stopped = unit.dev.stream_stop(); // the worker no longer writes after this
     unit.save_link_key();
+    if lost {
+        return Ok(Err(anyhow!("the unit was unplugged")));
+    }
+    Ok(stopped.context("stream stop"))
+}
+
+/// The second tuner's capture (a two-tuner model's, `--tuner 2`): boot the vendor firmware
+/// with the first tuner idle, tune the second and stream its TS on System2 while
+/// [`going_on`], keeping the secure session alive. Err: it never streamed; Ok: how the
+/// stream ended.
+fn capture_system2(
+    dev: &DeviceArgs,
+    tuning: Tuning,
+    sid: Option<u16>,
+    (feed, sink): (&Arc<Feed>, &Mutex<Sink>),
+    limit: Option<Duration>,
+    tty: bool,
+) -> Result<Result<()>> {
+    let mut unit = Unit::open(dev)?;
+    let mut t2 = unit.dev.tuner2().context("the second tuner")?;
+    let sys = match tuning {
+        Tuning::Terrestrial { hz } => {
+            t2.tune_t(hz).context("tune (ISDB-T)")?;
+            System::Terrestrial
+        }
+        Tuning::Satellite { hz, tsid } => {
+            t2.tune_s(hz, tsid).context("tune (ISDB-S)")?;
+            System::Satellite
+        }
+    };
+    tuner::wait_lock(|sys| t2.read_status(sys), sys)?;
+    t2.set_service_id(sid);
+    t2.stream_start(ts_sink(feed)).context("stream start")?;
+
+    let t0 = Instant::now();
+    let live = t2.live();
+    let mut lost = false;
+    while going_on(t0, limit, sink, tty) {
+        if live.device_lost() {
+            lost = true;
+            break;
+        }
+        // the first tuner is idle: the secure session is kept alive from here
+        unit.dev.idle_tick();
+    }
+    let stopped = t2.stream_stop();
     if lost {
         return Ok(Err(anyhow!("the unit was unplugged")));
     }
@@ -462,6 +509,8 @@ pub fn run(a: &CaptureArgs) -> Result<()> {
     let tty = io::stderr().is_terminal();
     let captured = if raw {
         capture_raw(&dev, tuning, (&feed, &sink), limit, tty)
+    } else if dev.tuner == 2 {
+        capture_system2(&dev, tuning, sid, (&feed, &sink), limit, tty)
     } else {
         capture_system1(&dev, tuning, sid, (&feed, &sink), limit, tty)
     };

@@ -105,6 +105,7 @@ impl BonDriver {
                 .clone()
                 .or_else(|| Some(self.tuner.trc_firmware())),
             index: given.index,
+            tuner: given.tuner,
             serial: given
                 .serial
                 .clone()
@@ -261,6 +262,7 @@ mod tests {
             fw: None,
             trc: None,
             index: 0,
+            tuner: 1,
             serial: None,
             state: None,
             state_dir: None,
@@ -295,6 +297,7 @@ mod tests {
             fw: None,
             trc: None,
             index: 0,
+            tuner: 1,
             serial: None,
             state: None,
             state_dir: None,

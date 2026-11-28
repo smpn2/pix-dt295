@@ -231,35 +231,62 @@ fn path_serial(path: &str) -> Option<String> {
     (!s.is_empty() && !s.contains('&')).then(|| s.to_ascii_uppercase())
 }
 
-/// The present devices matching `vid`/`pid`: (device path, path as text).
-fn matching_paths(vid: u16, pid: u16) -> Result<Vec<(Vec<u16>, String)>> {
-    let pat = format!("vid_{vid:04x}&pid_{pid:04x}");
+/// The vendor and product id in a device interface path: the device instance id's
+/// first part (`\\?\usb#vid_06b8&pid_103b#cd23456789#{guid}` -> (0x06B8, 0x103B)).
+/// `None` for an interface of a composite device (`...&pid_c22d&mi_00#...`).
+fn path_ids(path: &str) -> Option<(u16, u16)> {
+    let ids = path.split('#').nth(1)?.to_ascii_lowercase();
+    let (vid, pid) = ids.split_once('&')?;
+    let hex = |h: &str| (h.len() == 4).then(|| u16::from_str_radix(h, 16).ok())?;
+    Some((
+        hex(vid.strip_prefix("vid_")?)?,
+        hex(pid.strip_prefix("pid_")?)?,
+    ))
+}
+
+/// A present device of the vendor and a product id asked for.
+struct Matching {
+    /// The device interface path.
+    path: Vec<u16>,
+    /// The path as text.
+    name: String,
+    pid: u16,
+}
+
+/// The present devices of vendor `vid` with a product id in `pids`.
+fn matching_paths(vid: u16, pids: &[u16]) -> Result<Vec<Matching>> {
     Ok(DevInfo::usb_devices()?
         .paths()
         .into_iter()
-        .map(|p| {
-            let name = String::from_utf16_lossy(&p);
-            (p, name)
-        })
-        .filter(|(_, name)| name.to_ascii_lowercase().contains(&pat))
-        .collect())
-}
-
-pub(crate) fn list(vid: u16, pid: u16) -> Result<Vec<crate::Listed>> {
-    Ok(matching_paths(vid, pid)?
-        .into_iter()
-        .map(|(path, name)| crate::Listed {
-            serial: path_serial(&name),
-            available: Device::open_path(&path, None).is_ok(), // closed again at once
-            location: name,
+        .filter_map(|path| {
+            let name = String::from_utf16_lossy(&path);
+            match path_ids(&name) {
+                Some((v, pid)) if v == vid && pids.contains(&pid) => {
+                    Some(Matching { path, name, pid })
+                }
+                _ => None,
+            }
         })
         .collect())
 }
 
-pub(crate) fn present_serials(vid: u16, pid: u16) -> Result<Vec<String>> {
-    Ok(matching_paths(vid, pid)?
+pub(crate) fn list(vid: u16, pids: &[u16]) -> Result<Vec<crate::Listed>> {
+    Ok(matching_paths(vid, pids)?
         .into_iter()
-        .filter_map(|(_, name)| path_serial(&name))
+        .map(|m| crate::Listed {
+            pid: m.pid,
+            serial: path_serial(&m.name),
+            // closed again at once
+            available: Device::open_path(&m.path, None, m.pid).is_ok(),
+            location: m.name,
+        })
+        .collect())
+}
+
+pub(crate) fn present_serials(vid: u16, pids: &[u16]) -> Result<Vec<String>> {
+    Ok(matching_paths(vid, pids)?
+        .into_iter()
+        .filter_map(|m| path_serial(&m.name))
         .collect())
 }
 
@@ -271,6 +298,7 @@ pub(crate) struct Device {
     file: OwnedHandle,
     ctl_lock: Mutex<()>,
     serial: Option<String>,
+    pid: u16,
 }
 
 // SAFETY: WinUSB and file handles may be used from any thread; every transfer brings
@@ -290,18 +318,18 @@ impl Drop for Device {
 }
 
 impl Device {
-    pub(crate) fn open(vid: u16, pid: u16, index: usize) -> Result<Self> {
+    pub(crate) fn open(vid: u16, pids: &[u16], index: usize) -> Result<Self> {
         let mut found = 0;
         let mut ret = Err(Error::NoDevice);
-        for (path, name) in matching_paths(vid, pid)? {
+        for m in matching_paths(vid, pids)? {
             // Try to WinUSB-open each matching device; skip ones that fail (e.g. units
             // bound to the vendor driver). `index` counts only the WinUSB-openable
             // matches, so multiple units can coexist.
-            match Self::open_path(&path, path_serial(&name)) {
+            match Self::open_path(&m.path, path_serial(&m.name), m.pid) {
                 Ok(dev) if found == index => return Ok(dev),
                 Ok(_) => found += 1,
                 Err(e) => {
-                    debug!(path = %name, "not WinUSB-openable: {}", map_win_error(e));
+                    debug!(path = %m.name, "not WinUSB-openable: {}", map_win_error(e));
                     ret = Err(Error::Access); // a match existed but wasn't WinUSB
                 }
             }
@@ -309,13 +337,13 @@ impl Device {
         ret
     }
 
-    pub(crate) fn open_serial(vid: u16, pid: u16, serial: &str) -> Result<Self> {
-        let (path, name) = matching_paths(vid, pid)?
+    pub(crate) fn open_serial(vid: u16, pids: &[u16], serial: &str) -> Result<Self> {
+        let m = matching_paths(vid, pids)?
             .into_iter()
-            .find(|(_, name)| path_serial(name).is_some_and(|s| s.eq_ignore_ascii_case(serial)))
+            .find(|m| path_serial(&m.name).is_some_and(|s| s.eq_ignore_ascii_case(serial)))
             .ok_or(Error::NoDevice)?;
-        Self::open_path(&path, path_serial(&name)).map_err(|e| {
-            debug!(path = %name, "not WinUSB-openable: {}", map_win_error(e));
+        Self::open_path(&m.path, path_serial(&m.name), m.pid).map_err(|e| {
+            debug!(path = %m.name, "not WinUSB-openable: {}", map_win_error(e));
             match map_win_error(e) {
                 Error::NoDevice => Error::NoDevice, // unplugged in between
                 _ => Error::Access,
@@ -327,8 +355,16 @@ impl Device {
         self.serial.as_deref()
     }
 
+    pub(crate) fn pid(&self) -> u16 {
+        self.pid
+    }
+
     /// `CreateFileW` (overlapped, as WinUSB requires) + `WinUsb_Initialize`.
-    fn open_path(path: &[u16], serial: Option<String>) -> std::result::Result<Self, WIN32_ERROR> {
+    fn open_path(
+        path: &[u16],
+        serial: Option<String>,
+        pid: u16,
+    ) -> std::result::Result<Self, WIN32_ERROR> {
         let wide: Vec<u16> = path.iter().copied().chain([0]).collect();
         // SAFETY: `wide` is a NUL-terminated path; null security attributes and template are allowed.
         let h = unsafe {
@@ -357,6 +393,7 @@ impl Device {
             file,
             ctl_lock: Mutex::new(()),
             serial,
+            pid,
         })
     }
 
@@ -726,25 +763,27 @@ mod tests {
         let paths = DevInfo::usb_devices()
             .expect("SetupDiGetClassDevsW")
             .paths();
-        let mut dt295 = 0;
+        let mut ours = 0;
         for p in &paths {
             let s = String::from_utf16_lossy(p).to_ascii_lowercase();
             assert!(s.starts_with(r"\\?\"), "{s}");
             assert!(s.ends_with("{a5dcbf10-6530-11d2-901f-00c04fb951ed}"), "{s}");
-            dt295 += usize::from(s.contains("vid_06b8&pid_103b"));
+            ours += usize::from(
+                path_ids(&s).is_some_and(|(v, p)| v == crate::VID && crate::PIDS.contains(&p)),
+            );
         }
-        eprintln!("{} USB device interface(s), {dt295} PIX-DT295", paths.len());
+        eprintln!("{} USB device interface(s), {ours} of ours", paths.len());
     }
 
     #[test]
     fn open_absent_device_is_no_device() {
         // No device has VID/PID 0000:0000, so nothing is ever opened.
-        assert_matches!(Device::open(0, 0, 0), Err(Error::NoDevice));
+        assert_matches!(Device::open(0, &[0], 0), Err(Error::NoDevice));
         assert_matches!(
-            Device::open_serial(0, 0, "CD23456789"),
+            Device::open_serial(0, &[0], "CD23456789"),
             Err(Error::NoDevice)
         );
-        assert_eq!(list(0, 0).expect("enumerates"), []);
+        assert_eq!(list(0, &[0]).expect("enumerates"), []);
     }
 
     #[test]
@@ -768,6 +807,28 @@ mod tests {
             path_serial(&format!(r"\\?\usb#vid_06b8&pid_103b##{guid}")),
             None
         );
+    }
+
+    #[test]
+    fn ids_from_device_path() {
+        let guid = "{a5dcbf10-6530-11d2-901f-00c04fb951ed}";
+        assert_eq!(
+            path_ids(&format!(r"\\?\usb#vid_06b8&pid_1040#tk07002372#{guid}")),
+            Some((0x06B8, 0x1040))
+        );
+        assert_eq!(
+            path_ids(&format!(r"\\?\USB#VID_06B8&PID_103B#CD23456789#{guid}")),
+            Some((0x06B8, 0x103B))
+        );
+        // an interface of a composite device: the ids, then the interface number
+        assert_eq!(
+            path_ids(&format!(
+                r"\\?\usb#vid_046d&pid_c22d&mi_00#7&242dfaaa&0&0000#{guid}"
+            )),
+            None
+        );
+        assert_eq!(path_ids(r"\\?\usb#vid_06b8&pid_103"), None);
+        assert_eq!(path_ids(r"\\?\usb"), None);
     }
 
     #[test]

@@ -11,15 +11,17 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
-use std::thread::{self, JoinHandle};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use tracing::{error, info, warn};
 
+use dt295_core::Model;
 use dt295_core::bonini::DeviceSel;
-use dt295_core::fe1;
+use dt295_core::fe1::{self, FrontEnd, Port};
 use dt295_core::proto::{FW_STALL_LIMIT, Io, Proto, REG_FW_STATE};
 
+use crate::raw::{RawTune, RawWorker};
 use crate::s1::{KA_FIRST, KA_INTERVAL, Link, S1};
 use crate::ts::psi::PsiKeeper;
 use crate::{Error, PsiRecord, Result, Status, System, TsSink, fw};
@@ -29,9 +31,14 @@ use crate::{Error, PsiRecord, Result, Status, System, TsSink, fw};
 pub(crate) struct Shared {
     pub usb: dt295_usb::Device,
     st: Mutex<State>,
+    /// The first tuner's live values (its System1 stream's).
     pub live: Arc<LiveInner>,
     /// The host's callback for each link key the device hands out.
     journal: Mutex<Journal>,
+    /// A [`crate::Tuner2`] exists.
+    pub tuner2: AtomicBool,
+    /// The second tuner streams (System2).
+    pub s2_streaming: AtomicBool,
 }
 
 /// Called with each link key the device hands out ([`Device::set_link_key_journal`]).
@@ -57,6 +64,11 @@ pub(crate) struct State {
     pub proto: Proto,
     pub link: Link,
     pub psi: PsiKeeper,
+    /// The B-CAS card session (stage 2) is open: once per boot, by the first stream of
+    /// either tuner.
+    pub card_open: bool,
+    /// Counts the boots ([`Device::start`]); 0 = none yet.
+    pub boot_gen: u64,
 }
 
 impl Shared {
@@ -65,18 +77,27 @@ impl Shared {
             proto: Proto::default(),
             link: Link::default(),
             psi: PsiKeeper::new(),
+            card_open: false,
+            boot_gen: 0,
         };
         Shared {
             usb,
             st: Mutex::new(st),
             live: Arc::new(LiveInner::new()),
             journal: Mutex::new(Journal::default()),
+            tuner2: AtomicBool::new(false),
+            s2_streaming: AtomicBool::new(false),
         }
     }
 
     /// The state (a panic elsewhere does not lock the device out: the state stays usable).
     pub(crate) fn lock(&self) -> MutexGuard<'_, State> {
         self.st.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// The state if nobody holds it now.
+    pub(crate) fn try_lock(&self) -> Option<MutexGuard<'_, State>> {
+        crate::s2::try_lock_state(&self.st)
     }
 
     /// Hand a link key the device just gave out to the host's journal, if it set one.
@@ -132,7 +153,7 @@ const ES_CLEAR: u8 = 1;
 const ES_SCRAMBLED: u8 = 2;
 
 impl LiveInner {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         LiveInner {
             epoch: Instant::now(),
             streaming: AtomicBool::new(false),
@@ -240,29 +261,11 @@ pub struct Device {
     /// The firmware reached idle / ready.
     fw_booted: bool,
     s1: S1,
-    /// The blob-free raw-TS stream worker, while one runs (its thread holds the device
-    /// I/O for the whole stream, like the System1 worker; the host only stops it).
+    /// The blob-free raw-TS stream worker, while one runs (it takes the device I/O one
+    /// operation at a time, beside the second tuner's; the host only stops it).
     raw: Option<RawWorker>,
-}
-
-/// A running blob-free raw-TS stream worker: it owns the device I/O (its thread holds
-/// the proto lock through one `with_io` for the whole capture), forwarding TS to the
-/// sink until `stop` is cleared. Its thread returns the sink and the capture result.
-struct RawWorker {
-    stop: Arc<AtomicBool>,
-    handle: JoinHandle<(TsSink, Result<crate::RawCaptureStats>)>,
-    /// A stop already waited the whole time for it: the next one does not wait again.
-    wedged: bool,
-}
-
-impl fmt::Debug for RawWorker {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("RawWorker")
-            .field("stop", &self.stop.load(Ordering::Relaxed))
-            .field("finished", &self.handle.is_finished())
-            .field("wedged", &self.wedged)
-            .finish()
-    }
+    /// The front end the tunes and streams use ([`Device::set_tuner`]).
+    fe: FrontEnd,
 }
 
 impl fmt::Debug for Device {
@@ -283,6 +286,10 @@ pub struct Live {
 }
 
 impl Live {
+    pub(crate) fn new(inner: Arc<LiveInner>) -> Self {
+        Live { inner }
+    }
+
     /// C/N (0.001 dB) sampled by the running stream's worker within the last 3 s.
     pub fn cn_mdb(&self) -> Option<i32> {
         self.inner.cn()
@@ -327,6 +334,10 @@ impl Live {
     }
 }
 
+/// Boots in this process, for [`State::boot_gen`] (unique, so a tune of the second tuner
+/// tells a later boot from the one it was on).
+static BOOTS: AtomicU64 = AtomicU64::new(0);
+
 /// Attempts and pause of [`Device::open_sel`].
 pub const OPEN_ATTEMPTS: usize = 5;
 pub const OPEN_RETRY_PAUSE: Duration = Duration::from_millis(400);
@@ -339,7 +350,7 @@ impl Device {
     pub fn open(index: usize) -> Result<Self> {
         Self::with_usb(dt295_usb::Device::open(
             dt295_usb::VID,
-            dt295_usb::PID,
+            &dt295_usb::PIDS,
             index,
         ))
     }
@@ -370,16 +381,17 @@ impl Device {
     pub fn open_serial(serial: &str) -> Result<Self> {
         Self::with_usb(dt295_usb::Device::open_serial(
             dt295_usb::VID,
-            dt295_usb::PID,
+            &dt295_usb::PIDS,
             serial,
         ))
     }
 
     /// Start a blob-free COLD raw-TS stream worker: host board bring-up, host-face tune,
-    /// capture arm and ring->EP pump, with no resident, no aux core and no vendor firmware
-    /// (see [`dt295_rawfw::rawstream::run_cold_stream`]). The worker pumps scrambled TS into
-    /// the sink until stopped; the host descrambles it with a real card. A channel change is
-    /// a stop + a fresh start on the new frequency.
+    /// capture arm and ring->EP feed, with no resident and no vendor firmware (the unit cores
+    /// and the aux core run only our code; see [`dt295_rawfw::rawstream::run_cold_stream`]).
+    /// The worker passes scrambled TS into the sink until stopped; the host descrambles it with a real
+    /// card. A channel change is a stop + a fresh start on the new frequency. On a two-tuner
+    /// model the second tuner streams beside it ([`crate::Tuner2::stream_start_cold`]).
     pub fn stream_start_cold(
         &mut self,
         terrestrial: bool,
@@ -392,39 +404,21 @@ impl Device {
         if self.raw.is_some() {
             return Err(Error::State("a raw-TS stream is already running".into()));
         }
-        let stop = Arc::new(AtomicBool::new(true));
-        let sh = Arc::clone(&self.sh);
-        let worker_stop = Arc::clone(&stop);
-        // The caller's span (the daemon's unit, say) goes with the worker, so its log lines
-        // say which unit they are about.
-        let span = tracing::Span::current();
-        let handle = thread::Builder::new()
-            .name("dt295-cold-worker".into())
-            .spawn(move || {
-                let _span = span.enter();
-                let mut sink = sink;
-                let result = sh.with_io(|io| {
-                    let cn_report = |mdb: i32| sh.live.publish_cn(mdb);
-                    dt295_rawfw::rawstream::run_cold_stream(
-                        io,
-                        terrestrial,
-                        freq_hz,
-                        tsid,
-                        full,
-                        duration,
-                        Some(&worker_stop),
-                        &mut sink,
-                        Some(&cn_report),
-                    )
-                });
-                (sink, result)
-            })
-            .map_err(Error::from)?;
-        self.raw = Some(RawWorker {
-            stop,
-            handle,
-            wedged: false,
-        });
+        let tune = RawTune {
+            terrestrial,
+            freq_hz,
+            tsid,
+            full,
+            duration,
+        };
+        let live = Arc::clone(&self.sh.live);
+        self.raw = Some(RawWorker::spawn(
+            Arc::clone(&self.sh),
+            live,
+            self.fe,
+            tune,
+            sink,
+        )?);
         Ok(())
     }
 
@@ -432,7 +426,7 @@ impl Device {
     /// worker ended on its own -- a capture fault or an unplug -- so the host can reap it
     /// with [`Device::stream_stop_raw`] and learn why.
     pub fn raw_running(&self) -> bool {
-        self.raw.as_ref().is_some_and(|w| !w.handle.is_finished())
+        self.raw.as_ref().is_some_and(RawWorker::running)
     }
 
     /// Whether a raw-TS worker slot is occupied (running, or ended but not yet reaped).
@@ -440,59 +434,12 @@ impl Device {
         self.raw.is_some()
     }
 
-    /// Stop the raw-TS worker and return what it captured (or its fault). The stream loop
-    /// polls the stop flag every pass (~1 ms) and exits on its own; a worker still in the
-    /// uninterruptible cold bootstrap finishes it first, then exits, which this waits out
-    /// (it does not abort the EP mid-bootstrap, which would fault the tune). A genuinely
-    /// wedged worker gets one EP nudge as a last resort; one that still will not exit keeps
-    /// its own device reference (nothing is freed under it) and a re-plug is the reset;
-    /// a later stop (another try, the close) gives that error at once if it still runs.
-    /// No-op if none is running.
+    /// Stop the raw-TS worker and return what it captured (or its fault). A worker still in
+    /// the cold bring-up finishes it first; one that will not exit is left running with its
+    /// own device reference (a re-plug is the reset), and a later stop gives that error at
+    /// once. No-op if none is running.
     pub fn stream_stop_raw(&mut self) -> Result<crate::RawCaptureStats> {
-        let Some(mut w) = self.raw.take() else {
-            return Ok(crate::RawCaptureStats::default());
-        };
-        if w.wedged && !w.handle.is_finished() {
-            self.raw = Some(w);
-            return Err(Error::State("the raw-TS stream worker did not exit".into()));
-        }
-        w.stop.store(false, Ordering::Relaxed);
-        // The stream loop polls the stop flag every pass (~1 ms, the EP read timeout) and
-        // exits on its own, so no EP abort is needed to unstick it. A worker still in the
-        // (uninterruptible) cold bootstrap -- the resident load + tune, ~13 s -- finishes
-        // that first and then sees the flag; we wait it out rather than abort its EP
-        // mid-bootstrap, which would fault the tune. A genuinely wedged worker gets one EP
-        // nudge as a last resort; one that still will not exit keeps its own device
-        // reference (nothing is freed under it) and a re-plug is the reset.
-        let t0 = Instant::now();
-        let mut nudged = false;
-        loop {
-            if w.handle.is_finished() {
-                // The worker has exited: no more C/N samples, so clear the live value now (a
-                // stopped stream must not report its last reading for the freshness window).
-                self.sh.live.reset_cn();
-                return match w.handle.join() {
-                    Ok((_, r)) => r,
-                    Err(_) => {
-                        error!("raw-TS worker panicked");
-                        Err(Error::State("the raw-TS stream worker panicked".into()))
-                    }
-                };
-            }
-            if !nudged && t0.elapsed() >= Duration::from_secs(25) {
-                nudged = true;
-                let _ = self.sh.usb.abort_pipe(crate::s1::EP_TS);
-            }
-            if t0.elapsed() >= Duration::from_secs(35) {
-                error!(
-                    "raw-TS worker did not exit within 35 s; leaving it running -- re-plug the device"
-                );
-                w.wedged = true;
-                self.raw = Some(w);
-                return Err(Error::State("the raw-TS stream worker did not exit".into()));
-            }
-            thread::sleep(Duration::from_millis(10));
-        }
+        crate::raw::stop(&mut self.raw, &self.sh, &self.sh.live)
     }
 
     /// Read one register of an I2C slave (e.g. the demod at 7-bit 0x10) over the host face
@@ -528,14 +475,9 @@ impl Device {
     /// has run and persists (across worker restarts and a reopen without a re-plug), so a
     /// later tune only needs a retune + rearm, not the once-per-plug bootstrap (a second
     /// bootstrap faults). A pure host-window read, safe on a cold device (it then reads the
-    /// stock boot0 body and returns false). No stream worker may run when this is called.
+    /// stock boot0 body and returns false). The second tuner's raw-TS stream may run.
     pub fn cold_monitor_installed(&self) -> bool {
-        // A read error defaults to "installed" (skip the bring-up), not "cold": re-running the
-        // once-per-plug full bring-up on a chip that is actually up faults it (needs a re-plug),
-        // whereas skipping it when the chip really is cold just fails this tune cleanly and the
-        // host retries. So the safe default on an unreadable probe is to not bring up again.
-        self.sh
-            .with_io(|io| dt295_rawfw::frmon_host::monitor_installed(io).unwrap_or(true))
+        crate::raw::monitor_installed(&self.sh)
     }
 
     /// Experimental blob-free COLD tune: host board bring-up + host-face I2C, then run
@@ -552,6 +494,7 @@ impl Device {
         match self.sh.with_io(|io| {
             Ok(dt295_rawfw::fjcore::cold_tune(
                 io,
+                self.fe,
                 terrestrial,
                 freq_hz,
                 tsid,
@@ -577,6 +520,7 @@ impl Device {
         match self.sh.with_io(|io| {
             Ok(dt295_rawfw::fjcore::cold_capture(
                 io,
+                self.fe,
                 terrestrial,
                 freq_hz,
                 tsid,
@@ -602,6 +546,7 @@ impl Device {
         match self.sh.with_io(|io| {
             Ok(dt295_rawfw::fjcore::cold_stream(
                 io,
+                self.fe,
                 terrestrial,
                 freq_hz,
                 tsid,
@@ -638,17 +583,54 @@ impl Device {
                 _ => Error::NoDevice,
             }
         })?;
-        Ok(Device {
+        let mut dev = Device {
             sh: Arc::new(Shared::new(usb)),
             fw_booted: false,
             s1: S1::new(),
             raw: None,
-        })
+            fe: FrontEnd::DT295,
+        };
+        dev.fe = dev.front_end(0).unwrap_or(FrontEnd::DT295);
+        dev.s1.fe = dev.fe;
+        Ok(dev)
+    }
+
+    /// The front end of tuner `n` (0-based) of this unit, its TS out of output A.
+    fn front_end(&self, n: usize) -> Option<FrontEnd> {
+        match self.model().tuners() {
+            1 => (n == 0).then_some(FrontEnd::DT295),
+            _ => FrontEnd::dt195w(n, Port::A),
+        }
+    }
+
+    /// Use tuner `n` (0-based; the two-tuner models have two) for the tunes and streams from now
+    /// on. Its TS goes out of the demod's output A, the one the System1 and raw-TS paths
+    /// take, so one stream at a time. An error past the model's tuners, or while a stream
+    /// runs.
+    pub fn set_tuner(&mut self, n: usize) -> Result<()> {
+        let fe = self
+            .front_end(n)
+            .ok_or(Error::Param("the unit has no such tuner"))?;
+        self.no_stream()?;
+        self.fe = fe;
+        self.s1.fe = fe;
+        Ok(())
+    }
+
+    /// The tuner the tunes and streams use (0-based).
+    pub fn tuner(&self) -> usize {
+        self.fe.tuner()
     }
 
     /// The device's USB serial number (`None` if the OS reports none).
     pub fn serial(&self) -> Option<&str> {
         self.sh.usb.serial()
+    }
+
+    /// The model, from the USB product id.
+    pub fn model(&self) -> Model {
+        // `open` takes only the product ids of `dt295_usb::PIDS`, each a model
+        Model::from_pid(self.sh.usb.pid()).unwrap_or(Model::Dt295)
     }
 
     /// The System1 transcoder firmware (`mb86m01_assp_osec_trc_m_h.bin`). Must be
@@ -698,6 +680,7 @@ impl Device {
     /// authenticate, power on the front end.
     pub fn start(&mut self, fw: &Path) -> Result<()> {
         self.no_stream()?;
+        let fe = self.fe;
         let mut g = self.sh.lock();
         let st = &mut *g;
         st.proto.fw_stall = 0; // a fresh (re)start gets to try commands again
@@ -705,11 +688,16 @@ impl Device {
         // fresh process does
         st.proto.ka_seq = 0;
         st.proto.ka_fails = 0;
+        if self.sh.s2_streaming.load(Ordering::Acquire) {
+            warn!("the unit starts again: the second tuner's stream ends");
+        }
+        st.boot_gen = 0; // not booted until it is
         let mut io = Io::new(&self.sh.usb, &mut st.proto);
         fw::boot(&mut io, fw, &mut st.link.alt)?;
         self.fw_booted = true;
         // a (re)boot drops the card session; the next stream re-establishes it
         self.s1.cas_ready = false;
+        st.card_open = false;
         // The keepalive clock starts with the fresh session, the first keepalive due
         // KA_FIRST after authentication. Not ~3 s: the firmware sometimes answers that
         // with a short challenge (hardware 2026-10-18: "keepalive FAILED" once per open).
@@ -721,7 +709,25 @@ impl Device {
         io.p.ka_last = Some(now.checked_sub(KA_INTERVAL - KA_FIRST).unwrap_or(now));
         // The System1 front end, whose demod init feeds the LSI the TS the stream path
         // needs; otherwise cmd(5,0,2) underruns to 0xFFFF.
-        fe1::power_on_init(&mut io)
+        fe1::power_on(&mut io, fe)?;
+        st.boot_gen = BOOTS.fetch_add(1, Ordering::Relaxed) + 1;
+        Ok(())
+    }
+
+    /// The second tuner of a two-tuner model (PIX-DT295W, PIX-DT195W), to tune and stream
+    /// beside this one (the first):
+    /// one at a time. Its System2 stream works while this `Device` keeps the unit booted
+    /// ([`Device::start`]); its raw-TS stream needs no firmware.
+    pub fn tuner2(&self) -> Result<crate::Tuner2> {
+        if self.model().tuners() < 2 {
+            return Err(Error::Param(
+                "only the two-tuner models (PIX-DT295W, PIX-DT195W) have a second tuner",
+            ));
+        }
+        if self.sh.tuner2.swap(true, Ordering::AcqRel) {
+            return Err(Error::State("the second tuner is in use".into()));
+        }
+        Ok(crate::Tuner2::new(Arc::clone(&self.sh)))
     }
 
     /// Open the B-CAS card session again in place, for a card put back in (no stream
@@ -778,14 +784,16 @@ impl Device {
 
     /// Tune ISDB-T and wait for lock.
     pub fn tune_t(&mut self, freq_hz: u32) -> Result<()> {
-        self.tune(System::Terrestrial, 0, |io| fe1::tune_t(io, freq_hz))
+        let fe = self.fe;
+        self.tune(System::Terrestrial, 0, |io| fe1::tune_t(io, fe, freq_hz))
     }
 
     /// Tune ISDB-S (`freq_hz` = IF, `tsid` = the broadcast TSID) and wait for lock.
     pub fn tune_s(&mut self, freq_hz: u32, tsid: u16) -> Result<()> {
         let mut got = None;
+        let fe = self.fe;
         self.tune(System::Satellite, tsid, |io| {
-            got = fe1::tune_s(io, freq_hz, tsid)?;
+            got = fe1::tune_s(io, fe, freq_hz, tsid)?;
             Ok(())
         })?;
         // the PSI keeper serves the TS the demod streams (without a TSID or with one
@@ -816,7 +824,8 @@ impl Device {
     /// Lock and C/N right after a tune (do not call while streaming).
     pub fn read_status(&mut self, sys: System) -> Result<Status> {
         self.no_stream()?;
-        self.sh.with_io(|io| fe1::read_status(io, sys))
+        let fe = self.fe;
+        self.sh.with_io(|io| fe1::read_status(io, fe, sys))
     }
 
     /// Service to stream next; `None` = every service of the TS.

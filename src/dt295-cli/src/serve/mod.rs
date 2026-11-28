@@ -9,7 +9,9 @@
 //! previous session timing out under the new one, keepalives that never went out,
 //! streams left running with their TS queued, link keys to carry between processes.
 //! Here one thread per unit owns the device; a client only asks for a stream and reads
-//! it, or asks for the unit's C/N (`status`, answered here without the unit's thread).
+//! it, or asks for a tuner's C/N (`status`, answered here without the unit's thread). A
+//! two-tuner model's second tuner has a thread of its own, so its streams run beside the first
+//! tuner's ([`tuner2`]).
 //!
 //! The units are those of the configuration ([`conf`]), opened at the start, or without
 //! any there, each unit a request asks for (or the only one connected), opened then on
@@ -18,6 +20,8 @@
 pub mod conf;
 /// The protocol, shared with the BonDriver (`dt295-core`).
 pub use dt295::serve as proto;
+mod raw;
+mod tuner2;
 mod unit;
 
 pub use daemon::{ServeArgs, run};
@@ -40,7 +44,8 @@ mod daemon {
 
     use super::conf::{self, Conf};
     use super::proto::{Asked, MAX_LINE, Mode, Reply};
-    use super::unit::{self, Info, Job};
+    use super::tuner2::{self, Slot};
+    use super::unit::{self, Info, Job, Spec};
     use crate::tuner::{install_ctrl_c, stopping};
 
     /// How long a client may take to send its request line.
@@ -232,13 +237,32 @@ mod daemon {
         while matches!((&*conn).read(&mut sent), Ok(n) if n > 0) {}
     }
 
-    /// A unit's thread: where its requests go and what it tells about itself.
+    /// A unit's threads (the first tuner's, which keeps the unit, and a two-tuner model's
+    /// second tuner's): where their requests go and what they tell about themselves.
     struct Handle {
         serial: String,
         mode: Mode,
         jobs: Sender<Job>,
         thread: JoinHandle<()>,
         info: Arc<Info>,
+        jobs2: Sender<Job>,
+        thread2: JoinHandle<()>,
+        info2: Arc<Info>,
+        /// Where the unit's thread lends the second tuner (to a second tuner's thread
+        /// started again, too).
+        slot: Arc<Slot>,
+    }
+
+    impl Handle {
+        /// Where the requests for tuner `n` go, and what it tells (`None`: its thread
+        /// ended).
+        fn tuner(&self, n: u8) -> Option<(&Sender<Job>, &Info)> {
+            let (jobs, thread, info) = match n {
+                2 => (&self.jobs2, &self.thread2, &self.info2),
+                _ => (&self.jobs, &self.thread, &self.info),
+            };
+            (!thread.is_finished()).then_some((jobs, &**info))
+        }
     }
 
     /// The units being served.
@@ -261,9 +285,10 @@ mod daemon {
 
         /// Whether a unit serves a request (a thread that ended serves none).
         fn busy(&self) -> bool {
-            self.list
-                .iter()
-                .any(|u| !u.thread.is_finished() && u.info.busy())
+            self.list.iter().any(|u| {
+                (!u.thread.is_finished() && u.info.busy())
+                    || (!u.thread2.is_finished() && u.info2.busy())
+            })
         }
 
         fn find(&self, serial: &str) -> Option<&Handle> {
@@ -278,24 +303,55 @@ mod daemon {
             Ok(&self.list[self.list.len() - 1])
         }
 
-        /// Start the thread of unit `serial`, on `mode`.
+        /// Start the threads of unit `serial`, on `mode`.
         fn start(&self, serial: &str, mode: Mode) -> std::io::Result<Handle> {
-            let info = Arc::new(Info::default());
-            let fixed = !self.conf.units.is_empty();
-            let (jobs, thread) = unit::spawn(
-                serial.to_owned(),
+            let slot = Arc::new(Slot::default());
+            let spec = Spec {
+                serial: serial.to_owned(),
                 mode,
-                fixed,
-                Arc::clone(&self.conf),
-                Arc::clone(&info),
-            )?;
+                fixed: !self.conf.units.is_empty(),
+                slot: Arc::clone(&slot),
+            };
+            let info = Arc::new(Info::default());
+            let (jobs, thread) = unit::spawn(spec, Arc::clone(&self.conf), Arc::clone(&info))?;
+            // a two-tuner model's second tuner streams beside the first (on either path)
+            let info2 = Arc::new(Info::default());
+            let (jobs2, thread2) =
+                tuner2::spawn(serial.to_owned(), Arc::clone(&slot), Arc::clone(&info2))?;
             Ok(Handle {
                 serial: serial.to_owned(),
                 mode,
                 jobs,
                 thread,
                 info,
+                jobs2,
+                thread2,
+                info2,
+                slot,
             })
+        }
+
+        /// Start the second tuner's thread of the unit at `i` again (the one before
+        /// ended); it borrows the tuner from the same unit's thread.
+        fn start_tuner2(&mut self, i: usize) -> Result<(), String> {
+            let serial = self.list[i].serial.clone();
+            let slot = Arc::clone(&self.list[i].slot);
+            let info2 = Arc::new(Info::default());
+            let (jobs2, thread2) = tuner2::spawn(serial.clone(), slot, Arc::clone(&info2))
+                .map_err(|e| {
+                    format!("cannot start the thread of unit {serial} tuner 2 again: {e}")
+                })?;
+            let u = &mut self.list[i];
+            u.jobs2 = jobs2;
+            u.info2 = info2;
+            let gone = std::mem::replace(&mut u.thread2, thread2);
+            let how = if gone.join().is_err() {
+                "panicked"
+            } else {
+                "ended"
+            };
+            warn!("unit {serial}: the thread of tuner 2 {how}; started again");
+            Ok(())
         }
 
         /// The serial number of the unit a request names, or of the only one there is
@@ -318,17 +374,26 @@ mod daemon {
             pick(unit, &served, dt295::present_serials().ok())
         }
 
-        /// Where the requests for `serial` go: its thread, started now (on `mode`) if it
+        /// Where the requests for `serial` go: its threads, started now (on `mode`) if it
         /// has none yet. A thread that ended while the daemon runs (a bug that panicked)
-        /// is started again: the unit closed as the thread unwound, so on the request's
-        /// mode, or a configured unit's. Until one is started, the one that ended stays.
-        fn route(&mut self, serial: &str, mode: Mode) -> Result<&Handle, String> {
+        /// is started again: the unit's (the first tuner's) closed the unit as it unwound,
+        /// so it starts on the request's mode, or a configured unit's, and the second
+        /// tuner's thread with it (the one before ends on its own, its requests' channel
+        /// gone); the second tuner's alone, for a request of `tuner` 2. Until one is
+        /// started, the one that ended stays.
+        fn route(&mut self, serial: &str, mode: Mode, tuner: u8) -> Result<&Handle, String> {
             if let Some(i) = self
                 .list
                 .iter()
                 .position(|u| u.serial.eq_ignore_ascii_case(serial))
             {
-                if !self.list[i].thread.is_finished() || stopping() {
+                if stopping() {
+                    return Ok(&self.list[i]);
+                }
+                if !self.list[i].thread.is_finished() {
+                    if tuner == 2 && self.list[i].thread2.is_finished() {
+                        self.start_tuner2(i)?;
+                    }
                     return Ok(&self.list[i]);
                 }
                 let serial = self.list[i].serial.clone();
@@ -359,7 +424,11 @@ mod daemon {
 
         /// End the threads (each ends once it is not streaming).
         fn close(self) {
-            let threads: Vec<_> = self.list.into_iter().map(|u| u.thread).collect();
+            let threads: Vec<_> = self
+                .list
+                .into_iter()
+                .flat_map(|u| [u.thread, u.thread2])
+                .collect();
             for thread in threads {
                 let _ = thread.join();
             }
@@ -380,7 +449,7 @@ mod daemon {
         let there = present.unwrap_or_else(|| served.to_vec());
         match (unit, there.as_slice()) {
             ("", [only]) => Ok(only.clone()),
-            ("", []) => Err("no PIX-DT295 is connected".into()),
+            ("", []) => Err("no PIX-DT295(W) / PIX-DT195(W) is connected".into()),
             ("", _) => Err(format!(
                 "several units are connected ({}); name one",
                 there.join(", ")
@@ -408,11 +477,11 @@ mod daemon {
             .and_then(|_| Asked::parse(&line))
             .and_then(|a| units.resolve(a.unit()).map(|serial| (a, serial)));
         let why = match asked {
-            Ok((Asked::Status(_), serial)) => {
+            Ok((Asked::Status(s), serial)) => {
                 let cn_mdb = units
                     .find(&serial)
-                    .filter(|u| !u.thread.is_finished())
-                    .and_then(|u| u.info.cn_mdb());
+                    .and_then(|u| u.tuner(s.tuner))
+                    .and_then(|(_, info)| info.cn_mdb());
                 let ok = Reply::Ok {
                     unit: Some(serial),
                     cn_mdb,
@@ -421,16 +490,17 @@ mod daemon {
                 return;
             }
             Ok((Asked::Tune(req), serial)) => {
-                match units.route(&serial, req.mode.unwrap_or(Mode::System1)) {
+                match units.route(&serial, req.mode.unwrap_or(Mode::System1), req.tuner) {
                     Ok(unit) => {
                         let _ = conn.set_read_timeout(None);
-                        match unit.jobs.send(Job { req, conn }) {
-                            Ok(()) => return,
-                            Err(e) => {
-                                conn = e.0.conn;
-                                "the daemon is stopping".to_owned()
+                        // a thread that ended is not started again only as the daemon stops
+                        if let Some((jobs, _)) = unit.tuner(req.tuner) {
+                            match jobs.send(Job { req, conn }) {
+                                Ok(()) => return,
+                                Err(e) => conn = e.0.conn,
                             }
                         }
+                        "the daemon is stopping".to_owned()
                     }
                     Err(why) => why,
                 }
@@ -522,7 +592,7 @@ mod daemon {
             assert!(pick("", &[], Some(list(&["A", "B"]))).is_err_and(|e| e.contains("several")));
             assert_eq!(
                 pick("", &list(&["A"]), Some(vec![])),
-                Err("no PIX-DT295 is connected".into())
+                Err("no PIX-DT295(W) / PIX-DT195(W) is connected".into())
             );
             // the units cannot be listed: those served
             assert_eq!(pick("", &list(&["A"]), None), Ok("A".into()));

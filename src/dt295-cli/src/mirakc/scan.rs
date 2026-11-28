@@ -291,6 +291,7 @@ fn tune(
 
     let req = Request {
         unit: serial.to_owned(),
+        tuner: 1,
         tuning,
         sid,
         mode: None,

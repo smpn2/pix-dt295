@@ -31,6 +31,7 @@ use crate::device::Shared;
 use crate::ts::link::{self, KeyVerdict};
 use crate::ts::{packet, route};
 use crate::{Error, Result, System, TsSink, cas, dtvdec};
+use dt295_core::fe1::FrontEnd;
 use dt295_core::fwdl::{bulk_download, write_idle_params};
 use dt295_core::proto::{FW_STALL_LIMIT, Io, REG_FW_STATE, REG_IRQ, sleep_ms};
 
@@ -631,6 +632,8 @@ pub(crate) struct S1 {
     pub cur_system: Option<System>,
     /// TSID of the current satellite tune (0 = none / terrestrial).
     pub cur_tsid: u16,
+    /// The front end tuned (the worker samples its demod).
+    pub fe: FrontEnd,
 }
 
 impl S1 {
@@ -644,6 +647,7 @@ impl S1 {
             worker_stuck: false,
             cur_system: None,
             cur_tsid: 0,
+            fe: FrontEnd::DT295,
         }
     }
 
@@ -663,11 +667,14 @@ impl S1 {
     /// every later channel was lost. Only after a session exists, and not once the
     /// firmware has wedged.
     pub(crate) fn idle_keepalive(&self, sh: &Shared) {
-        if self.trc_path.is_none() || !self.cas_ready || self.running() || sh.live.streaming() {
+        if self.running() || sh.live.streaming() {
             return;
         }
         let mut g = sh.lock();
-        if g.proto.fw_stall >= FW_STALL_LIMIT
+        // no stream this session yet (either tuner's opens the card session): it does not
+        // lapse
+        if !g.card_open
+            || g.proto.fw_stall >= FW_STALL_LIMIT
             || g.proto.ka_last.is_some_and(|t| t.elapsed() < KA_INTERVAL)
         {
             return; // not due: no device I/O
@@ -712,6 +719,7 @@ impl S1 {
         sh.live.reset_stream();
         let cfg = worker::Config {
             sys: self.cur_system,
+            fe: self.fe,
             output,
         };
         self.worker = Some(worker::spawn(Arc::clone(sh), cfg, s)?);
@@ -831,14 +839,18 @@ impl S1 {
             // card session, so cmd(5,0,2) faults to 0xFFFF unless stage 2 was accepted
             // (0x0a00) first.
             if !self.cas_ready {
-                let _ = cas::bcas_stage2(&mut io);
+                if !st.card_open {
+                    // the card session, once per boot (the second tuner may have opened it)
+                    let _ = cas::bcas_stage2(&mut io);
+                    st.card_open = true;
+                }
                 // stage 2 answers 0x0a00 also with no card in; this says more
                 let card = bcas_state(&io);
                 sh.live.set_card_state(card);
                 info!("b-cas: card state {card}");
                 st.link.verified = false; // a fresh key: the PAT check re-proves it
                 st.link.fails = 0;
-                match dtvdec::derive_link_key(&mut io) {
+                match dtvdec::link_key(&mut io, dtvdec::ENDPOINT_SYSTEM1) {
                     Ok(k) => {
                         st.link.key = k;
                         st.link.fresh = Some(k);

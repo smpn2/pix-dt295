@@ -1,13 +1,13 @@
-//! `dt295 list`: the connected PIX-DT295 units, to find the serial number to put on a
-//! unit's label and into `[Tuner] DeviceSerial` (plug them in one at a time).
+//! `dt295 list`: the connected units (PIX-DT295(W), PIX-DT195(W)), to find the serial number
+//! to put on a unit's label and into `[Tuner] DeviceSerial` (plug them in one at a time).
 
 use anyhow::{Context, Result};
-use dt295::Listed;
+use dt295::{Listed, Model};
 
 pub fn run() -> Result<()> {
     let units = dt295::list().context("enumerate USB devices")?;
     if units.is_empty() {
-        println!("no PIX-DT295 connected");
+        println!("no PIX-DT295(W) / PIX-DT195(W) connected");
         return Ok(());
     }
     print!("{}", render(&units));
@@ -15,9 +15,9 @@ pub fn run() -> Result<()> {
 }
 
 /// One line per unit: the index it has now (free units only, as `-i` counts them), the
-/// serial, whether it is free, and where it is.
+/// serial, the model, whether it is free, and where it is.
 fn render(units: &[Listed]) -> String {
-    let mut out = String::from("index  serial        status  location\n");
+    let mut out = String::from("index  serial        model       status  location\n");
     let mut index = 0;
     for u in units {
         let idx = if u.available {
@@ -27,8 +27,9 @@ fn render(units: &[Listed]) -> String {
             "-".to_owned()
         };
         out.push_str(&format!(
-            "{idx:<5}  {:<12}  {:<6}  {}\n",
+            "{idx:<5}  {:<12}  {:<10}  {:<6}  {}\n",
             u.serial.as_deref().unwrap_or("(none)"),
+            Model::from_pid(u.pid).map_or("?", Model::name),
             if u.available { "free" } else { "busy" },
             u.location
         ));
@@ -53,6 +54,7 @@ mod tests {
 
     fn unit(serial: Option<&str>, available: bool, location: &str) -> Listed {
         Listed {
+            pid: if location == "c" { 0x1040 } else { 0x103B },
             serial: serial.map(str::to_owned),
             location: location.to_owned(),
             available,
@@ -67,10 +69,13 @@ mod tests {
             unit(None, true, "c"),
         ]);
         let lines: Vec<_> = s.lines().collect();
-        assert_eq!(lines[0], "index  serial        status  location");
-        assert_eq!(lines[1], "-      CD23456789    busy    a");
-        assert_eq!(lines[2], "0      EF34567890    free    b");
-        assert_eq!(lines[3], "1      (none)        free    c");
+        assert_eq!(
+            lines[0],
+            "index  serial        model       status  location"
+        );
+        assert_eq!(lines[1], "-      CD23456789    PIX-DT295   busy    a");
+        assert_eq!(lines[2], "0      EF34567890    PIX-DT295   free    b");
+        assert_eq!(lines[3], "1      (none)        PIX-DT195W  free    c");
         assert!(lines[4].starts_with("busy = "));
     }
 

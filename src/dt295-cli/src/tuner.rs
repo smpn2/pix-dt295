@@ -41,6 +41,10 @@ pub struct DeviceArgs {
     #[arg(long, value_name = "SERIAL")]
     pub serial: Option<String>,
 
+    /// Which tuner of the unit: 1, or 2 on a two-tuner model (PIX-DT295W, PIX-DT195W).
+    #[arg(long, value_name = "N", default_value_t = 1, value_parser = clap::value_parser!(u8).range(1..=2))]
+    pub tuner: u8,
+
     /// A state file (the unit's, <serial>.state next to the BonDriver or in /var/lib/dt295):
     /// use its link key and save the key this stream proves, so the next program to open
     /// the unit (dt295 serve, or dt295 again) can still decrypt its TS.
@@ -111,10 +115,12 @@ pub fn open_device(a: &DeviceArgs) -> Result<Device> {
         Some(s) => DeviceSel::Serial(s.clone()),
         None => DeviceSel::Index(a.index),
     };
-    let dev = Device::open_sel(&sel).with_context(|| format!("open device ({sel})"))?;
+    let mut dev = Device::open_sel(&sel).with_context(|| format!("open device ({sel})"))?;
     if let Some(s) = dev.serial() {
-        tracing::info!("device serial {s}");
+        tracing::info!("device serial {s} ({})", dev.model().name());
     }
+    dev.set_tuner(usize::from(a.tuner) - 1)
+        .with_context(|| format!("tuner {} of a {}", a.tuner, dev.model().name()))?;
     Ok(dev)
 }
 
@@ -193,42 +199,7 @@ impl Unit {
     /// Wait up to 3 s for lock, showing the C/N on stderr; without it an error
     /// (`dt295 serve` refuses such a tune the same way), unless Ctrl-C came.
     pub fn wait_lock(&mut self, sys: System) -> Result<()> {
-        // on a terminal the line is redrawn; into a log (a recorder) only the last one
-        let tty = std::io::stderr().is_terminal();
-        let mut line = String::new();
-        let mut cn = None;
-        for _ in 0..30 {
-            if stopping() {
-                break;
-            }
-            if let Ok(st) = self.dev.read_status(sys) {
-                line = format!(
-                    "lock={} C/N={:.2} dB (raw 0x{:x})",
-                    u8::from(st.locked),
-                    f64::from(st.cn_mdb) / 1000.0,
-                    st.raw
-                );
-                if tty {
-                    eprint!("{line}\r");
-                }
-                if st.locked {
-                    cn = None;
-                    break;
-                }
-                cn = Some(st.cn_mdb);
-            }
-            thread::sleep(Duration::from_millis(100));
-        }
-        if tty {
-            eprintln!();
-        } else if !line.is_empty() {
-            eprintln!("{line}");
-        }
-        match cn {
-            Some(cn) if !stopping() => bail!("no lock (C/N {:.1} dB)", f64::from(cn) / 1000.0),
-            None if line.is_empty() && !stopping() => bail!("no lock (no status)"),
-            _ => Ok(()),
-        }
+        wait_lock(|sys| self.dev.read_status(sys), sys)
     }
 
     /// Save the link key a stream proved to the state file, if it changed. The unproved
@@ -252,5 +223,49 @@ impl Unit {
                 Err(e) => eprintln!("link key: cannot save {}: {e}", p.display()),
             }
         }
+    }
+}
+
+/// Wait up to 3 s for the tuned demod to lock, reading its status with `read`, showing
+/// the C/N on stderr; without it an error, unless Ctrl-C came.
+pub fn wait_lock(
+    mut read: impl FnMut(System) -> dt295::Result<dt295::Status>,
+    sys: System,
+) -> Result<()> {
+    // on a terminal the line is redrawn; into a log (a recorder) only the last one
+    let tty = std::io::stderr().is_terminal();
+    let mut line = String::new();
+    let mut cn = None;
+    for _ in 0..30 {
+        if stopping() {
+            break;
+        }
+        if let Ok(st) = read(sys) {
+            line = format!(
+                "lock={} C/N={:.2} dB (raw 0x{:x})",
+                u8::from(st.locked),
+                f64::from(st.cn_mdb) / 1000.0,
+                st.raw
+            );
+            if tty {
+                eprint!("{line}\r");
+            }
+            if st.locked {
+                cn = None;
+                break;
+            }
+            cn = Some(st.cn_mdb);
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    if tty {
+        eprintln!();
+    } else if !line.is_empty() {
+        eprintln!("{line}");
+    }
+    match cn {
+        Some(cn) if !stopping() => bail!("no lock (C/N {:.1} dB)", f64::from(cn) / 1000.0),
+        None if line.is_empty() && !stopping() => bail!("no lock (no status)"),
+        _ => Ok(()),
     }
 }

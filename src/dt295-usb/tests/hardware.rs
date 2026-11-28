@@ -5,7 +5,7 @@ use std::assert_matches;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use dt295_usb::{Device, Error, PID, VID};
+use dt295_usb::{Device, Error, PIDS, VID};
 
 const EP_EVENTS: u8 = 0x83;
 const EP_TS: u8 = 0x81;
@@ -13,7 +13,7 @@ const EP_TS: u8 = 0x81;
 #[test]
 #[ignore = "opens the real PIX-DT295"]
 fn smoke() {
-    let dev = Device::open(VID, PID, 0).expect("open");
+    let dev = Device::open(VID, &PIDS, 0).expect("open");
 
     // Interrupt IN (events): data or a timeout are both fine.
     let mut ev = [0u8; 64];

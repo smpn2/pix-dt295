@@ -1,5 +1,5 @@
-//! `dt295 driver`: put the PIX-DT295 units on WinUSB without Zadig, or give them back to
-//! the vendor driver.
+//! `dt295 driver`: put the units (PIX-DT295(W), PIX-DT195(W)) on WinUSB without Zadig, or
+//! give them back to the vendor driver (the PIX-DT195W has none for Windows).
 //!
 //! `install` uses the WinUSB driver that ships with Windows (`winusb.inf`, "WinUsb
 //! Device", hardware id `USB\MS_COMP_WINUSB`): it is picked from the USBDevice class
@@ -40,14 +40,21 @@ pub struct Target {
     pub elevated: bool,
 }
 
-/// The hardware id of the PIX-DT295.
-const HWID: &str = r"USB\VID_06B8&PID_103B";
+/// The hardware ids of the models: (id, whether the vendor has a Windows driver for it).
+const HWIDS: [(&str, bool); 4] = [
+    (r"USB\VID_06B8&PID_103B", true),  // PIX-DT295
+    (r"USB\VID_06B8&PID_103C", true),  // PIX-DT295W
+    (r"USB\VID_06B8&PID_103A", true),  // PIX-DT195 (a Mac model; the Xit driver has it)
+    (r"USB\VID_06B8&PID_1040", false), // PIX-DT195W (a Mac model)
+];
 
 /// A unit as the driver tools see it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Unit {
     instance_id: String,
     serial: String,
+    /// The vendor has a Windows driver for its model (`restore` can put it back).
+    vendor_driver: bool,
     /// The service of the installed driver: `WinUSB`, `PXMB86M0XUSB` (vendor) or empty.
     service: String,
     inf: String,
@@ -112,7 +119,7 @@ pub fn run(cmd: &DriverCommand) -> anyhow::Result<()> {
 
 fn print_status(units: &[Unit]) {
     if units.is_empty() {
-        println!("no PIX-DT295 connected");
+        println!("no PIX-DT295(W) / PIX-DT195(W) connected");
         return;
     }
     println!(
@@ -177,7 +184,7 @@ mod win {
     use windows_sys::core::GUID;
 
     use super::{
-        DriverCommand, HWID, Target, Unit, print_status, quote_arg, select, serial_of, winusb_inf,
+        DriverCommand, HWIDS, Target, Unit, print_status, quote_arg, select, serial_of, winusb_inf,
     };
 
     /// GUID_DEVCLASS_USBDEVICE, the setup class of WinUSB devices.
@@ -232,8 +239,10 @@ mod win {
         let picked = select(&all, t.serial.as_deref());
         if picked.is_empty() {
             match &t.serial {
-                Some(s) => bail!("no connected PIX-DT295 with serial {s}"),
-                None => bail!("no PIX-DT295 connected"),
+                Some(s) => {
+                    bail!("no connected PIX-DT295(W) / PIX-DT195(W) with serial {s}")
+                }
+                None => bail!("no PIX-DT295(W) / PIX-DT195(W) connected"),
             }
         }
         let mut failed = 0;
@@ -245,6 +254,10 @@ mod win {
                 }
                 Change::Restore if u.provider.eq_ignore_ascii_case(VENDOR_PROVIDER) => {
                     println!("{}: already on the vendor driver", u.serial);
+                    continue;
+                }
+                Change::Restore if !u.vendor_driver => {
+                    println!("{}: its model has no vendor driver for Windows", u.serial);
                     continue;
                 }
                 Change::Install => install_winusb(&u.instance_id),
@@ -398,7 +411,7 @@ mod win {
         }
     }
 
-    /// The connected PIX-DT295 units.
+    /// The connected units.
     fn units() -> anyhow::Result<Vec<Unit>> {
         let usb = wide("USB");
         // SAFETY: all present devices of the USB enumerator, any class.
@@ -424,9 +437,12 @@ mod win {
             let ids = property(&set, &dev, SPDRP_HARDWAREID)
                 .map(|b| multi_sz(&b))
                 .unwrap_or_default();
-            if !ids.iter().any(|id| id.eq_ignore_ascii_case(HWID)) {
+            let Some(&(_, vendor_driver)) = HWIDS
+                .iter()
+                .find(|(hwid, _)| ids.iter().any(|id| id.eq_ignore_ascii_case(hwid)))
+            else {
                 continue;
-            }
+            };
             let mut id = [0u16; 512];
             // SAFETY: `id` holds 512 characters.
             if unsafe {
@@ -444,6 +460,7 @@ mod win {
             let instance_id = from_wide(&id);
             out.push(Unit {
                 serial: serial_of(&instance_id).to_owned(),
+                vendor_driver,
                 service: property(&set, &dev, SPDRP_SERVICE)
                     .map(|b| from_wide(&b))
                     .unwrap_or_default(),
@@ -705,8 +722,9 @@ mod tests {
 
     fn unit(serial: &str, service: &str) -> Unit {
         Unit {
-            instance_id: format!(r"{HWID}\{serial}"),
+            instance_id: format!(r"{}\{serial}", HWIDS[0].0),
             serial: serial.to_owned(),
+            vendor_driver: true,
             service: service.to_owned(),
             inf: String::new(),
             provider: String::new(),

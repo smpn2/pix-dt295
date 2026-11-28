@@ -22,6 +22,10 @@ pub struct RegArgs {
     #[arg(long, value_name = "SERIAL")]
     pub serial: Option<String>,
 
+    /// The tuner the cold-* commands use: 1, or 2 on a two-tuner model (PIX-DT295W, PIX-DT195W).
+    #[arg(long, value_name = "N", default_value_t = 1, value_parser = clap::value_parser!(u8).range(1..=2))]
+    pub tuner: u8,
+
     #[command(subcommand)]
     pub command: RegCommand,
 }
@@ -157,11 +161,13 @@ fn unhex(s: &str) -> Result<Vec<u8>> {
 }
 
 pub fn run(a: &RegArgs) -> Result<()> {
-    let dev = match &a.serial {
+    let mut dev = match &a.serial {
         Some(s) => Device::open_serial(s),
         None => Device::open(a.index),
     }
     .context("opening the PIX-DT295")?;
+    dev.set_tuner(usize::from(a.tuner) - 1)
+        .with_context(|| format!("tuner {} of a {}", a.tuner, dev.model().name()))?;
 
     match &a.command {
         RegCommand::Read { addr, len } => {

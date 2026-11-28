@@ -1,4 +1,6 @@
-//! USB transport for the PIX-DT295 (VID 0x06B8, PID 0x103B).
+//! USB transport for the PIX-DT295 (VID 0x06B8, PID 0x103B) and its siblings, the
+//! PIX-DT295W (0x103C), the PIX-DT195 (0x103A) and the PIX-DT195W (0x1040), which have the
+//! same USB interface.
 //!
 //! A thin, blocking API over the one interface the driver uses: vendor control
 //! transfers on EP0, bulk OUT (firmware download, EP 0x02), interrupt IN (events,
@@ -35,9 +37,18 @@ mod usbfs;
 #[cfg(unix)]
 use usbfs as backend;
 
-/// PIX-DT295 USB vendor / product id.
+/// PIXELA's USB vendor id.
 pub const VID: u16 = 0x06B8;
-pub const PID: u16 = 0x103B;
+/// The PIX-DT295's USB product id.
+pub const PID_DT295: u16 = 0x103B;
+/// The PIX-DT295W's USB product id.
+pub const PID_DT295W: u16 = 0x103C;
+/// The PIX-DT195's USB product id (a Mac model).
+pub const PID_DT195: u16 = 0x103A;
+/// The PIX-DT195W's USB product id (a Mac model).
+pub const PID_DT195W: u16 = 0x1040;
+/// Every product id this crate opens.
+pub const PIDS: [u16; 4] = [PID_DT295, PID_DT295W, PID_DT195, PID_DT195W];
 
 /// Transport errors.
 #[derive(Debug, thiserror::Error)]
@@ -74,6 +85,8 @@ pub struct Setup {
 /// A present device as [`list`] reports it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Listed {
+    /// The USB product id (one of the ones [`list`] was given).
+    pub pid: u16,
     /// The USB serial number (iSerialNumber, e.g. `CD23456789`; upper case on
     /// Windows, where it comes from the device instance id); `None` if the OS has none.
     pub serial: Option<String>,
@@ -84,51 +97,59 @@ pub struct Listed {
     pub available: bool,
 }
 
-/// The present devices matching `vid`/`pid`, in enumeration order. Each one is opened
-/// and closed again to fill in [`Listed::available`] (no transfers).
+/// The present devices of vendor `vid` with a product id in `pids`, in enumeration
+/// order. Each one is opened and closed again to fill in [`Listed::available`] (no
+/// transfers).
 ///
 /// [`Device::open`]'s index counts only the available ones (on Windows; see there).
-pub fn list(vid: u16, pid: u16) -> Result<Vec<Listed>> {
-    backend::list(vid, pid)
+pub fn list(vid: u16, pids: &[u16]) -> Result<Vec<Listed>> {
+    backend::list(vid, pids)
 }
 
-/// The USB serial numbers of the present devices matching `vid`/`pid`, without
-/// opening any (a host that holds one open can poll whether it is still there).
-pub fn present_serials(vid: u16, pid: u16) -> Result<Vec<String>> {
-    backend::present_serials(vid, pid)
+/// The USB serial numbers of the present devices of vendor `vid` with a product id in
+/// `pids`, without opening any (a host that holds one open can poll whether it is still
+/// there).
+pub fn present_serials(vid: u16, pids: &[u16]) -> Result<Vec<String>> {
+    backend::present_serials(vid, pids)
 }
 
-/// An opened PIX-DT295 (interface 0 claimed).
+/// An opened device (interface 0 claimed).
 #[derive(Debug)]
 pub struct Device {
     inner: backend::Device,
 }
 
 impl Device {
-    /// Open the `index`-th (0-based) device matching `vid`/`pid`. On Windows the index
-    /// counts only the devices this process can open: one in use by another process
-    /// (or not bound to WinUSB) is skipped, so with several units the numbers shift --
-    /// select by serial number there ([`Device::open_serial`]). On Linux the index counts
-    /// the free units the same way. When there are not that many, [`Error::Access`] if one
-    /// was skipped (it may be free in a moment), else [`Error::NoDevice`].
-    pub fn open(vid: u16, pid: u16, index: usize) -> Result<Self> {
+    /// Open the `index`-th (0-based) device of vendor `vid` with a product id in `pids`,
+    /// in enumeration order. On Windows the index counts only the devices this process
+    /// can open: one in use by another process (or not bound to WinUSB) is skipped, so
+    /// with several units the numbers shift -- select by serial number there
+    /// ([`Device::open_serial`]). On Linux the index counts the free units the same way.
+    /// When there are not that many, [`Error::Access`] if one was skipped (it may be free
+    /// in a moment), else [`Error::NoDevice`].
+    pub fn open(vid: u16, pids: &[u16], index: usize) -> Result<Self> {
         Ok(Self {
-            inner: backend::Device::open(vid, pid, index)?,
+            inner: backend::Device::open(vid, pids, index)?,
         })
     }
 
-    /// Open the device matching `vid`/`pid` whose USB serial number is `serial`
-    /// (ASCII case-insensitive). [`Error::NoDevice`] if no such device is present,
-    /// [`Error::Access`] if it is in use or not openable.
-    pub fn open_serial(vid: u16, pid: u16, serial: &str) -> Result<Self> {
+    /// Open the device of vendor `vid` with a product id in `pids` whose USB serial
+    /// number is `serial` (ASCII case-insensitive). [`Error::NoDevice`] if no such device
+    /// is present, [`Error::Access`] if it is in use or not openable.
+    pub fn open_serial(vid: u16, pids: &[u16], serial: &str) -> Result<Self> {
         Ok(Self {
-            inner: backend::Device::open_serial(vid, pid, serial)?,
+            inner: backend::Device::open_serial(vid, pids, serial)?,
         })
     }
 
     /// The device's USB serial number, as [`Listed::serial`].
     pub fn serial(&self) -> Option<&str> {
         self.inner.serial()
+    }
+
+    /// The device's USB product id.
+    pub fn pid(&self) -> u16 {
+        self.inner.pid()
     }
 
     /// Control IN; returns the number of bytes received.

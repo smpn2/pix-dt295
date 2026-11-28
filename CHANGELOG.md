@@ -1,5 +1,16 @@
 # 変更履歴
 
+## 0.7.0
+
+- PIX-DT295W と PIX-DT195(W) (Mac 用) に対応 (PIX-DT295W と PIX-DT195 は実機では未確認)。
+  PIX-DT195(W) は、Windows では `dt295 driver install` で WinUSB にして使う
+- 2 チューナー機 (PIX-DT295W、PIX-DT195W) の 2 つのチューナーで同時に受信できるように変更 (通常モードと raw-TS モード)。
+  2 つ目は `dt295 capture` / `dt295 tune` の `--tuner 2`、BonDriver の `[Tuner] TunerNumber=2` で使う
+- raw-TS モードで、TS の転送をチップのハードウェアに任せるように変更 (2 チューナー機で CS を 2 本同時に受信しても TS が欠けない)
+- Mac 用のソフト (StationTV for Mac、Xit for Mac) に入っているファームウェアでも使える
+- ヌルパケット (PID 0x1FFF) を捨てるように変更 (地デジの録画の大きさが、ほかのドライバーの約 1.8 倍になっていた)
+- 衛星の選局で、チューナーに書く値を純正ドライバーと同じに変更
+
 ## 0.6.0
 
 - BonDriver は個体を直接開かず、DLL のフォルダーの `dt295.exe` で起動した `dt295 serve` を通して視聴するように変更 (使い終わると自動で終了)。

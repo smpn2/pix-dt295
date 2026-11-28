@@ -11,6 +11,11 @@
 //! A unit streams on one path, System1 or raw-TS: the configured one, or (a unit opened
 //! for a request) the one its first request asked for. A request for the other path is
 //! refused while the unit is open.
+//!
+//! A two-tuner model's second tuner streams on a thread of its own ([`super::tuner2`]); this
+//! one lends it the tuner while the unit is open, and boots the unit again when its
+//! firmware faulted while no stream runs here. On the raw-TS path the two tuners stream
+//! the same way, each through its own TS capture of the chip ([`super::raw`]).
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -22,12 +27,12 @@ use std::time::{Duration, Instant};
 
 use dt295::ipc::{Conn, peer_closed};
 use dt295::state::{State, key_journal};
-use dt295::{CardWatch, Device, Live, RAW_STALL, System, TsSink, raw_stall_due};
+use dt295::{CardWatch, Device, Live, System, TsSink};
 use tracing::{info, warn};
 
 use super::conf::Conf;
 use super::proto::{Mode, Reply, Request, Tuning};
-use crate::rawts;
+use super::tuner2::Slot;
 use crate::tuner::stopping;
 
 /// A request and the connection its TS goes to.
@@ -36,7 +41,7 @@ pub struct Job {
     pub conn: Conn,
 }
 
-/// What a unit's thread tells the daemon: whether it is busy (`--idle-exit` waits for
+/// What a tuner's thread tells the daemon: whether it is busy (`--idle-exit` waits for
 /// it), and the C/N of its stream (`status`).
 #[derive(Debug, Default)]
 pub struct Info {
@@ -58,11 +63,11 @@ impl Info {
         live.cn_mdb().or(*tuned)
     }
 
-    fn set_busy(&self, busy: bool) {
+    pub(super) fn set_busy(&self, busy: bool) {
         self.busy.store(busy, Ordering::Release);
     }
 
-    fn set_stream(&self, stream: Option<(Live, Option<i32>)>) {
+    pub(super) fn set_stream(&self, stream: Option<(Live, Option<i32>)>) {
         *self.stream.lock().unwrap_or_else(PoisonError::into_inner) = stream;
     }
 }
@@ -74,7 +79,7 @@ const PRESENCE_EVERY: Duration = Duration::from_secs(5);
 /// How long to wait before trying to open (or boot) the unit again.
 const OPEN_RETRY: Duration = Duration::from_secs(5);
 /// The streaming loop's cadence (client gone, new request, link key to save).
-const POLL: Duration = Duration::from_millis(200);
+pub(super) const POLL: Duration = Duration::from_millis(200);
 /// TS buffered for a slow client, in the worker's reads (up to 64 KiB each): seconds
 /// of TS. Beyond it the TS is dropped (and counted), so a client that stops reading
 /// never stalls the USB reads.
@@ -83,26 +88,40 @@ const QUEUE_READS: usize = 256;
 /// before the next tune (the remux can stop emitting TS after many bring-ups).
 const SILENT: Duration = Duration::from_secs(10);
 
-/// Start the thread of unit `serial`, streaming on `mode`; `fixed`: the configuration's
-/// (the mode never changes).
+/// What a unit's thread starts with: its serial number, its path (`fixed`: the
+/// configuration's, never changed), and where it lends a two-tuner model's second tuner.
+pub struct Spec {
+    pub serial: String,
+    pub mode: Mode,
+    pub fixed: bool,
+    pub slot: Arc<Slot>,
+}
+
+/// Start the thread of a unit (its first tuner).
 pub fn spawn(
-    serial: String,
-    mode: Mode,
-    fixed: bool,
+    spec: Spec,
     conf: Arc<Conf>,
     info: Arc<Info>,
 ) -> std::io::Result<(mpsc::Sender<Job>, JoinHandle<()>)> {
     let (tx, rx) = mpsc::channel();
     let thread = thread::Builder::new()
-        .name(format!("unit {serial}"))
-        .spawn(move || run(&serial, mode, fixed, &conf, &info, &rx))?;
+        .name(format!("unit {}", spec.serial))
+        .spawn(move || run(spec, &conf, &info, &rx))?;
     Ok((tx, thread))
 }
 
-fn run(serial: &str, mode: Mode, fixed: bool, conf: &Conf, info: &Info, jobs: &Receiver<Job>) {
+fn run(spec: Spec, conf: &Conf, info: &Info, jobs: &Receiver<Job>) {
+    let serial = spec.serial.as_str();
     let span = tracing::info_span!("unit", serial);
     let _entered = span.enter();
-    let mut unit = Unit::new(serial, mode == Mode::RawTs, fixed, conf, info);
+    let mut unit = Unit::new(
+        serial,
+        spec.mode == Mode::RawTs,
+        spec.fixed,
+        conf,
+        info,
+        spec.slot,
+    );
     let mut next = None;
     // the client of the last request served
     let mut last: Option<String> = None;
@@ -119,7 +138,7 @@ fn run(serial: &str, mode: Mode, fixed: bool, conf: &Conf, info: &Info, jobs: &R
                 Err(RecvTimeoutError::Disconnected) => break,
             },
         };
-        let job = yield_to_queued(job, jobs, serial, last.as_deref());
+        let job = yield_to_queued(job, jobs, &format!("unit {serial}"), last.as_deref());
         last.clone_from(&job.req.client);
         let busy = Busy::new(info);
         next = unit.serve(job, jobs);
@@ -134,12 +153,43 @@ fn same_client(asked: &Request, running: &Request) -> bool {
     asked.client.is_some() && asked.client == running.client
 }
 
+/// What came for a tuner while `running` streams on it.
+pub(super) enum Queued {
+    Nothing,
+    /// A request that takes the tuner over.
+    Takeover(Job),
+    /// The daemon stops.
+    Stop,
+}
+
+/// Take the next request for a tuner (`name`: "unit X", "unit X tuner 2") while `running`
+/// streams on it: an `if-free` one of another client (a background job, a client that
+/// does not cut another's stream off) is refused (`busy`); any other takes the tuner over.
+pub(super) fn queued(jobs: &Receiver<Job>, running: &Request, name: &str) -> Queued {
+    match jobs.try_recv() {
+        Ok(mut job) if job.req.if_free && !same_client(&job.req, running) => {
+            info!("{}: refused, the tuner is streaming", job.req.to_line());
+            let _ = reply(&mut job.conn, &Reply::Busy(format!("{name} is streaming")));
+            Queued::Nothing
+        }
+        Ok(job) => Queued::Takeover(job),
+        Err(TryRecvError::Disconnected) => Queued::Stop,
+        Err(TryRecvError::Empty) => Queued::Nothing,
+    }
+}
+
 /// Of a background request (`if-free`: a logo run, a channel scan) and one queued
-/// right behind it, the one that takes units over goes first and the background one
+/// right behind it, the one that takes the tuner over goes first and the background one
 /// is refused: started, it would only be taken over seconds later. Two background
-/// requests: that of the client the unit served last goes (a TVTest changing its
-/// channel goes before another one's retry), else the first; the other is refused.
-fn yield_to_queued(job: Job, jobs: &Receiver<Job>, serial: &str, last: Option<&str>) -> Job {
+/// requests: that of the client the tuner served last (`last`) goes (a TVTest changing
+/// its channel goes before another one's retry), else the first; the other is refused.
+/// `name`: the tuner's, as in [`queued`].
+pub(super) fn yield_to_queued(
+    job: Job,
+    jobs: &Receiver<Job>,
+    name: &str,
+    last: Option<&str>,
+) -> Job {
     if !job.req.if_free {
         return job;
     }
@@ -155,7 +205,7 @@ fn yield_to_queued(job: Job, jobs: &Receiver<Job>, serial: &str, last: Option<&s
         "{}: refused, another request came with it",
         refused.req.to_line()
     );
-    let why = format!("unit {serial} is taken by another request");
+    let why = format!("{name} is taken by another request");
     let _ = reply(&mut refused.conn, &Reply::Busy(why));
     go
 }
@@ -194,10 +244,19 @@ struct Unit<'a> {
     next_open: Instant,
     absent_logged: bool,
     last_presence: Instant,
+    /// Where a two-tuner model's second tuner is lent to its thread.
+    slot: Arc<Slot>,
 }
 
 impl<'a> Unit<'a> {
-    fn new(serial: &'a str, raw: bool, fixed: bool, conf: &'a Conf, info: &'a Info) -> Self {
+    fn new(
+        serial: &'a str,
+        raw: bool,
+        fixed: bool,
+        conf: &'a Conf,
+        info: &'a Info,
+        slot: Arc<Slot>,
+    ) -> Self {
         Self {
             serial,
             conf,
@@ -214,7 +273,26 @@ impl<'a> Unit<'a> {
             next_open: Instant::now(),
             absent_logged: false,
             last_presence: Instant::now(),
+            slot,
         }
+    }
+
+    /// Lend a two-tuner model's second tuner to its thread (the unit is open, and booted on
+    /// the System1 path), or tell it there is none.
+    fn lend_tuner2(&self, dev: &Device) {
+        if dev.model().tuners() < 2 {
+            return self.slot.none();
+        }
+        match dev.tuner2() {
+            Ok(t2) => self.slot.lend(t2, self.raw),
+            Err(e) => warn!("the second tuner: {e}"),
+        }
+    }
+
+    /// Close the unit: take the second tuner back first (it holds the USB device too).
+    fn drop_device(&mut self, dev: Device) {
+        drop(self.slot.take_back());
+        drop(dev);
     }
 
     fn open_if_due(&mut self) {
@@ -276,6 +354,7 @@ impl<'a> Unit<'a> {
             Ok(()) => {
                 info!("opened and booted ({} ms)", t0.elapsed().as_millis());
                 self.watch = Some(CardWatch::new(&dev.live()));
+                self.lend_tuner2(&dev);
                 self.dev = Some(dev);
                 self.reboot = false;
                 self.last_presence = Instant::now();
@@ -285,7 +364,8 @@ impl<'a> Unit<'a> {
     }
 
     /// Open the unit cold and hold it: no vendor firmware, no boot, no secure session,
-    /// no state. The first tune does the blob-free cold bring-up; a later one retunes.
+    /// no state. The first tune (of either tuner) does the blob-free cold bring-up; a later
+    /// one retunes. A two-tuner model's second tuner is lent to its thread.
     fn open_raw(&mut self) {
         let dev = match Device::open_serial(self.serial) {
             Ok(dev) => dev,
@@ -303,6 +383,7 @@ impl<'a> Unit<'a> {
         };
         self.absent_logged = false;
         self.watch = None;
+        self.lend_tuner2(&dev);
         self.dev = Some(dev);
         self.last_presence = Instant::now();
         info!("opened (raw-TS, cold; no firmware)");
@@ -320,7 +401,7 @@ impl<'a> Unit<'a> {
                 if !self.present() {
                     info!("disconnected");
                     self.next_open = Instant::now();
-                    return; // dropping `dev` closes it
+                    return self.drop_device(dev);
                 }
             }
             self.dev = Some(dev);
@@ -333,7 +414,15 @@ impl<'a> Unit<'a> {
                 info!("disconnected");
                 self.save(&mut dev);
                 self.next_open = Instant::now();
-                return; // dropping `dev` closes it
+                return self.drop_device(dev);
+            }
+            // the firmware faulted while no stream ran here (under the second tuner's,
+            // say): boot again, and the second tuner's stream starts over
+            if dev.needs_recovery() {
+                warn!("the firmware faulted; booting the device again");
+                if let Err(e) = boot(&mut dev, &self.conf.idle_firmware()) {
+                    warn!("cannot boot: {e}");
+                }
             }
         }
         self.save(&mut dev);
@@ -341,9 +430,7 @@ impl<'a> Unit<'a> {
     }
 
     fn present(&self) -> bool {
-        dt295::present_serials().map_or(true, |serials| {
-            serials.iter().any(|s| s.eq_ignore_ascii_case(self.serial))
-        })
+        present(self.serial)
     }
 
     /// Write the state file if a stream proved a link key or (not streaming) the PSI
@@ -480,6 +567,7 @@ impl<'a> Unit<'a> {
         if reply(&mut conn, &ok).is_err() {
             pipe.closed.store(true, Ordering::Release); // the client is gone already
         }
+        let name = format!("unit {}", self.serial);
         let writer = {
             let pipe = Arc::clone(&pipe);
             thread::Builder::new()
@@ -502,20 +590,13 @@ impl<'a> Unit<'a> {
             if pipe.closed.load(Ordering::Acquire) || streaming.client_closed() {
                 break "the client went away";
             }
-            match jobs.try_recv() {
-                // a background job (logo collection), or a client that does not cut
-                // another's stream off, never takes a stream over
-                Ok(mut job) if job.req.if_free && !same_client(&job.req, &req) => {
-                    info!("{}: refused, the unit is streaming", job.req.to_line());
-                    let why = format!("unit {} is streaming", self.serial);
-                    let _ = reply(&mut job.conn, &Reply::Busy(why));
-                }
-                Ok(job) => {
+            match queued(jobs, &req, &name) {
+                Queued::Nothing => {}
+                Queued::Takeover(job) => {
                     takeover = Some(job);
-                    break "a new request takes the unit over";
+                    break "a new request takes the tuner over";
                 }
-                Err(TryRecvError::Disconnected) => break "the daemon stops",
-                Err(TryRecvError::Empty) => {}
+                Queued::Stop => break "the daemon stops",
             }
             if dev.live().device_lost() {
                 unplugged = true;
@@ -588,193 +669,66 @@ impl<'a> Unit<'a> {
         if unplugged {
             info!("disconnected");
             self.next_open = Instant::now();
+            self.drop_device(dev);
         } else {
             self.dev = Some(dev);
         }
         takeover
     }
 
-    /// Serve one request in blob-free raw-TS mode: bring the chip up cold (once per
-    /// plug) or retune, and stream the scrambled TS to the client. No firmware, no
-    /// secure session, no state, no B-CAS (the host descrambles).
+    /// Serve one raw-TS request of the first tuner ([`super::raw::serve`]); a two-tuner model's
+    /// second tuner streams beside it on its own thread.
     fn serve_raw(&mut self, job: Job, jobs: &Receiver<Job>) -> Option<Job> {
-        let Job { req, mut conn } = job;
         if self.dev.is_none() {
             self.open();
         }
         let Some(mut dev) = self.dev.take() else {
+            let Job { mut conn, .. } = job;
             let why = format!("unit {} is not connected", self.serial);
             let _ = reply(&mut conn, &Reply::Error(why));
             return None;
         };
-
-        let t0 = Instant::now();
-        let (pipe, queue) = Pipe::new();
-        let full = match rawts::start(&mut dev, req.tuning, pipe.sink()) {
-            Ok(full) => full,
-            Err(why) => {
-                warn!("{}: {why}", req.to_line());
-                let _ = reply(&mut conn, &Reply::Error(why));
-                self.dev = Some(dev);
-                return None;
-            }
+        let tuner = super::raw::Tuner {
+            serial: self.serial,
+            number: 1,
+            info: self.info,
         };
-        // the cold bootstrap and the lock wait take seconds; wait (bounded) for the first TS
-        if !rawts::wait_first_ts(&dev, || pipe.bytes.load(Ordering::Relaxed)) {
-            let why = if stopping() {
-                let _ = dev.stream_stop_raw();
-                "the daemon stops".to_owned()
-            } else {
-                rawts::why_no_ts(&mut dev, full)
-            };
-            warn!("{}: {why}", req.to_line());
-            let _ = reply(&mut conn, &Reply::Error(why));
-            self.dev = Some(dev);
-            return None;
-        }
-        info!(
-            "{}: streaming raw-TS ({} ms)",
-            req.to_line(),
-            t0.elapsed().as_millis()
-        );
-        // the worker publishes the C/N of the lock as the stream starts
-        let cn_mdb = dev.live().cn_mdb();
-        self.info.set_stream(Some((dev.live(), cn_mdb)));
-        let streaming = Streaming::new(self.info, &pipe, &conn);
-        let ok = Reply::Ok {
-            unit: Some(self.serial.to_owned()),
-            cn_mdb,
-        };
-        if reply(&mut conn, &ok).is_err() {
-            pipe.closed.store(true, Ordering::Release); // the client is gone already
-        }
-        let writer = {
-            let pipe = Arc::clone(&pipe);
-            thread::Builder::new()
-                .name(format!("unit {} writer", self.serial))
-                .spawn(move || write_ts(&pipe, &queue, conn))
-        };
-        if writer.is_err() {
-            pipe.closed.store(true, Ordering::Release);
-        }
-
-        let t_stream = Instant::now();
-        let mut takeover = None;
-        let mut unplugged = false;
-        let mut stall: Option<(u64, Instant)> = None;
-        // Consecutive restarts that delivered no TS (off air / no lock): back off a little each
-        // time, up to a few seconds, so a dead channel does not spin re-tuning every ~2 s.
-        let mut idle_restarts = 0u32;
-        let end = loop {
-            if stopping() {
-                break "the daemon stops";
-            }
-            if pipe.closed.load(Ordering::Acquire) || streaming.client_closed() {
-                break "the client went away";
-            }
-            match jobs.try_recv() {
-                Ok(mut job) if job.req.if_free && !same_client(&job.req, &req) => {
-                    info!("{}: refused, the unit is streaming", job.req.to_line());
-                    let why = format!("unit {} is streaming", self.serial);
-                    let _ = reply(&mut job.conn, &Reply::Busy(why));
-                }
-                Ok(job) => {
-                    takeover = Some(job);
-                    break "a new request takes the unit over";
-                }
-                Err(TryRecvError::Disconnected) => break "the daemon stops",
-                Err(TryRecvError::Empty) => {}
-            }
-            // the worker owns the device while streaming, so never touch it here. It ends
-            // on its own on a capture fault or an unplug (no proto access, no needs_recovery).
-            if !dev.raw_running() {
-                let ended = dev.stream_stop_raw();
-                if !self.present() {
-                    unplugged = true;
-                    break "the unit was unplugged";
-                }
-                let bytes = match ended {
-                    Ok(s) => s.bytes,
-                    Err(e) => {
-                        warn!("raw-TS: the stream worker failed: {e}");
-                        0
-                    }
-                };
-                if bytes == 0 {
-                    // No TS flowed (no lock / off air): back off (up to 5 s) so a dead channel
-                    // does not spin re-tuning and spamming the log every couple of seconds.
-                    idle_restarts = (idle_restarts + 1).min(5);
-                    thread::sleep(Duration::from_secs(u64::from(idle_restarts)));
-                } else {
-                    idle_restarts = 0;
-                }
-                if stopping() {
-                    break "the daemon stops";
-                }
-                warn!("raw-TS: the stream worker ended ({bytes} bytes); restarting the channel");
-                if let Err(why) = rawts::start(&mut dev, req.tuning, pipe.sink()) {
-                    warn!("{}: {why}", req.to_line());
-                    break "the worker ended and the restart failed";
-                }
-                stall = None;
-                continue;
-            }
-            // a halt never faults the worker: the only stall signal is the byte count not
-            // advancing. Restart the channel (stop + retune); a transient stall recovers.
-            if raw_stall_due(
-                &mut stall,
-                pipe.bytes.load(Ordering::Relaxed),
-                Instant::now(),
-            ) {
-                warn!("raw-TS: no TS for {RAW_STALL:?} while streaming; restarting the channel");
-                if let Err(e) = dev.stream_stop_raw() {
-                    // The stalled worker would not stop (it still holds the device I/O); the
-                    // rawts::start below would refuse it. End the stream; a re-plug is the reset.
-                    warn!("raw-TS: could not stop the stalled worker ({e}); ending");
-                    break "the stalled worker would not stop";
-                }
-                if let Err(why) = rawts::start(&mut dev, req.tuning, pipe.sink()) {
-                    warn!("{}: {why}", req.to_line());
-                    break "the datapath stalled and the restart failed";
-                }
-                continue;
-            }
-            thread::sleep(POLL);
-        };
-        if let Err(e) = dev.stream_stop_raw() {
-            warn!("raw stream stop failed: {e}");
-        }
-        drop(streaming);
-        if let Ok(writer) = writer {
-            let _ = writer.join();
-        }
-        let bytes = pipe.bytes.load(Ordering::Relaxed);
-        let dropped = pipe.dropped.load(Ordering::Relaxed);
-        info!(
-            "raw stream ended after {:.1} s ({end}): {bytes} bytes{}",
-            t_stream.elapsed().as_secs_f64(),
-            if dropped > 0 {
-                format!(", {dropped} dropped (the client did not read in time)")
-            } else {
-                String::new()
-            }
-        );
-        if unplugged {
+        let ended = super::raw::serve(&mut dev, job, jobs, &tuner, &|| self.present(), &|| false);
+        if ended.unplugged {
             info!("disconnected");
             self.next_open = Instant::now();
+            self.drop_device(dev);
         } else {
             self.dev = Some(dev);
         }
-        takeover
+        ended.takeover
     }
 
     fn close(&mut self) {
-        if let Some(mut dev) = self.dev.take()
-            && !self.raw
-        {
-            self.save(&mut dev);
+        if let Some(mut dev) = self.dev.take() {
+            if !self.raw {
+                self.save(&mut dev);
+            }
+            self.drop_device(dev);
         }
     }
+}
+
+impl Drop for Unit<'_> {
+    /// As a panic unwinds the thread: take the second tuner back, so its stream ends (its
+    /// client asks again, and the threads are started again for it) and the unit closes.
+    fn drop(&mut self) {
+        if thread::panicking() {
+            drop(self.slot.take_back());
+        }
+    }
+}
+
+/// Whether the unit `serial` is plugged in (true when the list cannot be read).
+pub(super) fn present(serial: &str) -> bool {
+    dt295::present_serials().map_or(true, |serials| {
+        serials.iter().any(|s| s.eq_ignore_ascii_case(serial))
+    })
 }
 
 /// Boot the firmware; once more if it stopped acking on the way (within a minute of
@@ -823,23 +777,23 @@ fn start(dev: &mut Device, req: &Request, sink: TsSink) -> Result<Option<i32>, S
     Ok(Some(cn_mdb))
 }
 
-fn reply(conn: &mut Conn, r: &Reply) -> std::io::Result<()> {
+pub(super) fn reply(conn: &mut Conn, r: &Reply) -> std::io::Result<()> {
     conn.write_all(format!("{}\n", r.to_line()).as_bytes())
 }
 
 /// The TS between the stream worker and the client: the worker never blocks on it.
-struct Pipe {
+pub(super) struct Pipe {
     tx: Mutex<Option<SyncSender<Vec<u8>>>>,
     /// Bytes the device delivered (queued or dropped).
-    bytes: AtomicU64,
+    pub bytes: AtomicU64,
     /// Bytes dropped because the client did not keep up.
-    dropped: AtomicU64,
+    pub dropped: AtomicU64,
     /// The client is gone.
-    closed: AtomicBool,
+    pub closed: AtomicBool,
 }
 
 impl Pipe {
-    fn new() -> (Arc<Self>, Receiver<Vec<u8>>) {
+    pub fn new() -> (Arc<Self>, Receiver<Vec<u8>>) {
         let (tx, rx) = mpsc::sync_channel(QUEUE_READS);
         let pipe = Self {
             tx: Mutex::new(Some(tx)),
@@ -850,7 +804,7 @@ impl Pipe {
         (Arc::new(pipe), rx)
     }
 
-    fn sink(self: &Arc<Self>) -> TsSink {
+    pub fn sink(self: &Arc<Self>) -> TsSink {
         let pipe = Arc::clone(self);
         Box::new(move |ts: &[u8]| pipe.push(ts))
     }
@@ -874,7 +828,7 @@ impl Pipe {
     }
 
     /// No more TS: the writer drains the queue and ends.
-    fn finish(&self) {
+    pub fn finish(&self) {
         self.tx
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -882,12 +836,12 @@ impl Pipe {
     }
 }
 
-/// A request served: the unit thread is busy (`--idle-exit` waits) until this is dropped,
-/// also by a panic.
-struct Busy<'a>(&'a Info);
+/// A request served: the tuner's thread is busy (`--idle-exit` waits) until this is
+/// dropped, also by a panic.
+pub(super) struct Busy<'a>(&'a Info);
 
 impl<'a> Busy<'a> {
-    fn new(info: &'a Info) -> Self {
+    pub(super) fn new(info: &'a Info) -> Self {
         info.set_busy(true);
         Self(info)
     }
@@ -900,17 +854,17 @@ impl Drop for Busy<'_> {
 }
 
 /// A stream running to a client. Dropped (at the stream's end, or as a panic unwinds
-/// the unit thread), it ends what the stream left: the writer's queue, the client's
+/// the tuner's thread), it ends what the stream left: the writer's queue, the client's
 /// connection (so the client asks again, and a thread is started again for it), and
 /// the stream's values for `status`.
-struct Streaming<'a> {
+pub(super) struct Streaming<'a> {
     info: &'a Info,
     pipe: Arc<Pipe>,
     shutter: Option<Conn>,
 }
 
 impl<'a> Streaming<'a> {
-    fn new(info: &'a Info, pipe: &Arc<Pipe>, conn: &Conn) -> Self {
+    pub(super) fn new(info: &'a Info, pipe: &Arc<Pipe>, conn: &Conn) -> Self {
         Self {
             info,
             pipe: Arc::clone(pipe),
@@ -919,7 +873,7 @@ impl<'a> Streaming<'a> {
     }
 
     /// Whether the client closed its end (also while nothing is written to it).
-    fn client_closed(&self) -> bool {
+    pub(super) fn client_closed(&self) -> bool {
         self.shutter.as_ref().is_some_and(peer_closed)
     }
 }
@@ -935,7 +889,7 @@ impl Drop for Streaming<'_> {
 }
 
 /// The writer thread: queue to client until the queue ends or the client is gone.
-fn write_ts(pipe: &Pipe, queue: &Receiver<Vec<u8>>, mut conn: Conn) {
+pub(super) fn write_ts(pipe: &Pipe, queue: &Receiver<Vec<u8>>, mut conn: Conn) {
     for chunk in queue {
         if conn.write_all(&chunk).is_err() {
             pipe.closed.store(true, Ordering::Release);
@@ -951,6 +905,7 @@ mod tests {
     fn req(client: Option<&str>, if_free: bool) -> Request {
         Request {
             unit: String::new(),
+            tuner: 1,
             tuning: Tuning::Terrestrial { hz: 557_142_857 },
             sid: None,
             mode: None,

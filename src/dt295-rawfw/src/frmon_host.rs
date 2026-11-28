@@ -258,31 +258,19 @@ pub fn install_write(io: &Io) -> Result<()> {
     armed
 }
 
-/// Drives our own on-chip TS pump (the boot0-RAM routine uploaded by [`upload_ts_pump`])
-/// through the monitor's CALL, for the blob-free cold stream worker.
-#[allow(missing_debug_implementations)] // holds a live USB/IO handle; not logged directly
-pub struct MonitorResident<'a, 'b> {
-    mon: Session<'a, 'b>,
-}
-
-impl<'a, 'b> MonitorResident<'a, 'b> {
-    pub fn new(io: &'b Io<'a>) -> Self {
-        MonitorResident {
-            mon: Session::new(io),
-        }
-    }
-
-    /// Run our own on-chip TS pump (ring -> EP). The routine was uploaded by
-    /// [`upload_ts_pump`]; a fire-and-forget CALL runs it (the pump returns nothing the host
-    /// uses, so skipping the reply read halves its control traffic).
-    pub fn pump(&mut self) -> Result<()> {
-        self.mon.call_fast(fw::PUMP_ADDRESS)
-    }
+/// Run a TS pump once (the boot0-RAM routine uploaded by [`upload_pump`]): a fire-and-forget
+/// monitor CALL (the pump returns nothing the host uses, so skipping the reply read halves its
+/// control traffic). `seq` is the caller's monitor sequence number, advanced here. The CALL is
+/// one control transfer, so two stream workers can each run their pump between the other's.
+pub fn call_pump(io: &Io, pump: &fw::Pump, seq: &mut u32) -> Result<()> {
+    *seq = seq.wrapping_add(1);
+    let req = fw::pack(*seq, fw::OP_CALL, pump.address, 0, 0, &[]);
+    Staging::new(io).send(&req)
 }
 
 /// Upload a routine's bytes to `addr` through the monitor, verifying each block by
 /// reading it back (the routine is sizeable, so a bad placement must fail loudly).
-fn upload_routine(io: &Io, addr: u32, code: &[u8]) -> Result<()> {
+pub(crate) fn upload_routine(io: &Io, addr: u32, code: &[u8]) -> Result<()> {
     let mut mon = Session::new(io);
     let mut off = 0usize;
     while off < code.len() {
@@ -304,12 +292,26 @@ fn upload_routine(io: &Io, addr: u32, code: &[u8]) -> Result<()> {
     Ok(())
 }
 
-/// Upload our TS pump routine to boot0 RAM through the monitor, ready to be CALLed
-/// each stream-loop pass (see [`MonitorResident::pump`]).
-pub fn upload_ts_pump(io: &Io) -> Result<()> {
-    let code = fw::ts_pump();
-    upload_routine(io, fw::PUMP_ADDRESS, &code)?;
-    info!("frmon: TS pump uploaded ({} bytes)", code.len());
+/// Upload a TS pump routine to boot0 RAM through the monitor, ready to be CALLed each
+/// stream-loop pass ([`call_pump`]): the one that drains the aux core's staging when `staged`
+/// (the prefetch has the capture's ring), else the one that drains the ring itself.
+pub fn upload_pump(io: &Io, pump: &fw::Pump, staged: bool) -> Result<()> {
+    let code = if staged {
+        fw::ts_pump_staged(pump)
+    } else {
+        fw::ts_pump_for(pump)
+    };
+    upload_routine(io, pump.address, &code)?;
+    info!(
+        "frmon: TS pump uploaded at 0x{:x} ({} bytes, {})",
+        pump.address,
+        code.len(),
+        if staged {
+            "from the aux core's staging"
+        } else {
+            "from the ring"
+        }
+    );
     Ok(())
 }
 

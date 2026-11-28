@@ -1,3 +1,7 @@
-# PIX-DT295: the dt295 group (dt295 serve) and the logged-in user (dt295 capture and
-# the like) may open it. uaccess works only in a file sorted before 73-seat-late.rules.
+# PIX-DT295 (103b), PIX-DT295W (103c), PIX-DT195 (103a) and PIX-DT195W (1040): the
+# dt295 group (dt295 serve) and the logged-in user (dt295 capture and the like) may open
+# them. uaccess works only in a file sorted before 73-seat-late.rules.
 SUBSYSTEM=="usb", ATTR{idVendor}=="06b8", ATTR{idProduct}=="103b", MODE="0660", GROUP="dt295", TAG+="uaccess"
+SUBSYSTEM=="usb", ATTR{idVendor}=="06b8", ATTR{idProduct}=="103c", MODE="0660", GROUP="dt295", TAG+="uaccess"
+SUBSYSTEM=="usb", ATTR{idVendor}=="06b8", ATTR{idProduct}=="103a", MODE="0660", GROUP="dt295", TAG+="uaccess"
+SUBSYSTEM=="usb", ATTR{idVendor}=="06b8", ATTR{idProduct}=="1040", MODE="0660", GROUP="dt295", TAG+="uaccess"

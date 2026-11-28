@@ -226,6 +226,7 @@ pub(crate) struct Device {
     ctl_lock: Mutex<()>,
     eps: [EpSlot; 32],
     serial: Option<String>,
+    pid: u16,
 }
 
 impl fmt::Debug for Device {
@@ -236,26 +237,27 @@ impl fmt::Debug for Device {
     }
 }
 
-/// The present devices matching `vid`/`pid`.
-fn matching(vid: u16, pid: u16) -> Result<Vec<nusb::DeviceInfo>> {
+/// The present devices of vendor `vid` with a product id in `pids`.
+fn matching(vid: u16, pids: &[u16]) -> Result<Vec<nusb::DeviceInfo>> {
     Ok(nusb::list_devices()
         .wait()
         .map_err(map_error)?
-        .filter(|d| d.vendor_id() == vid && d.product_id() == pid)
+        .filter(|d| d.vendor_id() == vid && pids.contains(&d.product_id()))
         .collect())
 }
 
-pub(crate) fn present_serials(vid: u16, pid: u16) -> Result<Vec<String>> {
-    Ok(matching(vid, pid)?
+pub(crate) fn present_serials(vid: u16, pids: &[u16]) -> Result<Vec<String>> {
+    Ok(matching(vid, pids)?
         .into_iter()
         .filter_map(|d| d.serial_number().map(str::to_owned))
         .collect())
 }
 
-pub(crate) fn list(vid: u16, pid: u16) -> Result<Vec<crate::Listed>> {
-    Ok(matching(vid, pid)?
+pub(crate) fn list(vid: u16, pids: &[u16]) -> Result<Vec<crate::Listed>> {
+    Ok(matching(vid, pids)?
         .into_iter()
         .map(|d| crate::Listed {
+            pid: d.product_id(),
             serial: d.serial_number().map(str::to_owned),
             location: format!("bus {} address {}", d.bus_id(), d.device_address()),
             available: is_free(&d),
@@ -294,13 +296,13 @@ fn nth_free<T>(units: Vec<T>, mut free: impl FnMut(&T) -> bool, index: usize) ->
 
 impl Device {
     /// The `index`-th free unit, as WinUSB counts them (a held unit is skipped).
-    pub(crate) fn open(vid: u16, pid: u16, index: usize) -> Result<Self> {
-        let info = nth_free(matching(vid, pid)?, is_free, index)?;
+    pub(crate) fn open(vid: u16, pids: &[u16], index: usize) -> Result<Self> {
+        let info = nth_free(matching(vid, pids)?, is_free, index)?;
         Self::open_info(&info)
     }
 
-    pub(crate) fn open_serial(vid: u16, pid: u16, serial: &str) -> Result<Self> {
-        let info = matching(vid, pid)?
+    pub(crate) fn open_serial(vid: u16, pids: &[u16], serial: &str) -> Result<Self> {
+        let info = matching(vid, pids)?
             .into_iter()
             .find(|d| {
                 d.serial_number()
@@ -312,6 +314,10 @@ impl Device {
 
     pub(crate) fn serial(&self) -> Option<&str> {
         self.serial.as_deref()
+    }
+
+    pub(crate) fn pid(&self) -> u16 {
+        self.pid
     }
 
     fn open_info(info: &nusb::DeviceInfo) -> Result<Self> {
@@ -335,6 +341,7 @@ impl Device {
             ctl_lock: Mutex::new(()),
             eps: std::array::from_fn(|_| EpSlot::default()),
             serial: info.serial_number().map(str::to_owned),
+            pid: info.product_id(),
         })
     }
 
